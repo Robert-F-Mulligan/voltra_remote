@@ -86,7 +86,7 @@
  * numbers. The built-in Montserrat sizes above are only fallbacks for the LV_SYMBOL_* icons. */
 #define LV_FONT_CUSTOM_DECLARE LV_FONT_DECLARE(font_icons_26) LV_FONT_DECLARE(font_icons_18) \
     LV_FONT_DECLARE(font_poppins_14) LV_FONT_DECLARE(font_poppins_16) LV_FONT_DECLARE(font_poppins_18) \
-    LV_FONT_DECLARE(font_poppins_20) LV_FONT_DECLARE(font_poppins_22) LV_FONT_DECLARE(font_poppins_96) \
+    LV_FONT_DECLARE(font_poppins_20) LV_FONT_DECLARE(font_poppins_22) LV_FONT_DECLARE(font_poppins_30) LV_FONT_DECLARE(font_poppins_96) \
     LV_FONT_DECLARE(font_poppins_bold_64)
 
 #define LV_FONT_DEFAULT &font_poppins_16

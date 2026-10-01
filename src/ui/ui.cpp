@@ -31,9 +31,9 @@ namespace {
 #define C_TEXT     lv_color_hex(0xf8fafc)
 #define C_MUTED    lv_color_hex(0x94a3b8)
 #define C_UNLOADED lv_color_hex(0x3b82f6)
-#define C_LOADED   lv_color_hex(0xbefa3c)
+#define C_LOADED   lv_color_hex(0xc6fe28)
 // Unloaded, as on the Voltra: the weight in a muted green and the ring in grey.
-#define C_IDLE_NUM  lv_color_hex(0x283308)
+#define C_IDLE_NUM  lv_color_hex(0x29320d)
 #define C_IDLE_RING lv_color_hex(0x6b7280)
 #define C_CHAINS   lv_color_hex(0xa78bfa)
 #define C_ECC      lv_color_hex(0xf472b6)
@@ -97,6 +97,8 @@ struct Ui {
     lv_obj_t *btn_center = nullptr;
     lv_obj_t *lbl_weight = nullptr;
     lv_obj_t *lbl_unit = nullptr;
+    lv_obj_t *row_weight = nullptr;      // the weight number and its unit
+    lv_obj_t *lbl_link = nullptr;        // "Not Connected" / "Connecting..." in place of the weight
     lv_obj_t *lbl_state = nullptr;
     lv_obj_t *btn_gear = nullptr;
     lv_obj_t *lbl_gear = nullptr;
@@ -574,14 +576,15 @@ void refresh_main()
     bool ready = st.conn == ConnState::Ready;
     uint32_t now = millis();
 
-    // ring + weight
+    // ring + weight. Until the Voltra has reported its weight there is no weight to show,
+    // so the link state takes its place.
+    const bool weight_known = ready && st.weight >= voltra::MIN_TARGET_LB;
     lv_arc_set_range(ui.arc_weight, voltra::MIN_TARGET_LB, weight_max());
-    lv_arc_set_value(ui.arc_weight, ui.weight);
-    if (connected) {
-        lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
-    } else {
-        lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
-    }
+    lv_arc_set_value(ui.arc_weight, weight_known ? ui.weight : voltra::MIN_TARGET_LB);
+    lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
+    set_obj_hidden(ui.row_weight, !weight_known);
+    set_obj_hidden(ui.lbl_link, weight_known);
+    if (!weight_known) lv_label_set_text(ui.lbl_link, connected ? "Connecting..." : "Not Connected");
 
     bool loaded = st.loaded();
     bool pending = now < ui.toggle_pending_until && loaded != ui.toggle_target_loaded;
@@ -590,10 +593,8 @@ void refresh_main()
     lv_obj_set_style_arc_color(ui.arc_weight, ring, LV_PART_INDICATOR);
 
     const bool auto_loading = connected && (st.auto_loading() || now < ui.auto_load_pending_until);
-    if (!connected) {
-        lv_label_set_text(ui.lbl_state, "NOT CONNECTED");
-        lv_obj_set_style_text_color(ui.lbl_state, C_MUTED, 0);
-        lv_obj_set_style_text_color(ui.lbl_weight, C_MUTED, 0);
+    if (!weight_known) {
+        lv_label_set_text(ui.lbl_state, "");   // the big link message says it all
     } else if (auto_loading && !loaded) {
         // The Voltra's auto load: waiting for the cable to be pulled out and held, then
         // a 3 s countdown before it loads.
@@ -610,10 +611,6 @@ void refresh_main()
         lv_label_set_text(ui.lbl_state, "Tap to Unload");
         lv_obj_set_style_text_color(ui.lbl_state, C_TEXT, 0);
         lv_obj_set_style_text_color(ui.lbl_weight, C_LOADED, 0);
-    } else if (!ready) {
-        lv_label_set_text(ui.lbl_state, "CONNECTING...");
-        lv_obj_set_style_text_color(ui.lbl_state, C_MUTED, 0);
-        lv_obj_set_style_text_color(ui.lbl_weight, C_MUTED, 0);
     } else if (st.activation == 0) {
         lv_label_set_text(ui.lbl_state, "VOLTRA NOT ACTIVATED");
         lv_obj_set_style_text_color(ui.lbl_state, C_DANGER, 0);
@@ -862,8 +859,11 @@ void build_main()
     lv_obj_add_event_cb(ui.btn_center, on_center_clicked, LV_EVENT_SHORT_CLICKED, nullptr);
     lv_obj_add_event_cb(ui.btn_center, on_center_hold, LV_EVENT_LONG_PRESSED, nullptr);
     lv_obj_t *row = make_value_row(ui.btn_center, &font_poppins_96, &ui.lbl_weight, &ui.lbl_unit);
+    ui.row_weight = row;
+    ui.lbl_link = make_label(ui.btn_center, &font_poppins_30, C_MUTED, "Not Connected");
+    lv_obj_align(ui.lbl_link, LV_ALIGN_CENTER, 0, 0);
     lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);   // 8 px higher on screen than before
-    ui.lbl_state = make_label(ui.btn_center, &font_poppins_14, C_MUTED, "NOT CONNECTED");
+    ui.lbl_state = make_label(ui.btn_center, &font_poppins_14, C_MUTED, "");
     lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 4);
 
     ui.btn_gear = make_pill_button(ui.scr_main, 64, 64, C_TRACK, "", nullptr);
@@ -1190,6 +1190,7 @@ void handle_knob(int delta)
 
     switch (ui.screen) {
         case Screen::Main: {
+            if (ui.st.conn != ConnState::Ready || ui.st.weight < voltra::MIN_TARGET_LB) break;
             if (set_weight(apply_step(ui.weight, delta, step))) {
                 haptics_tick();
                 refresh_main();
