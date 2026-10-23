@@ -184,10 +184,10 @@ struct Ui {
 int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 
-/** Effective ceiling: the device reports a higher one when overdrive is configured. */
+/** Weight ceiling: the Voltra's own max-weight setting (230 lb until it is read). */
 int weight_max()
 {
-    return ui.st.max_weight > voltra::MIN_TARGET_LB ? ui.st.max_weight : voltra::MAX_TARGET_LB;
+    return ui.st.max_weight > voltra::MIN_TARGET_LB ? ui.st.max_weight : voltra::DEFAULT_MAX_TARGET_LB;
 }
 
 /**
@@ -592,7 +592,11 @@ void refresh_main()
     if (!connected) ring = C_TRACK;
     lv_obj_set_style_arc_color(ui.arc_weight, ring, LV_PART_INDICATOR);
 
-    const bool auto_loading = connected && (st.auto_loading() || now < ui.auto_load_pending_until);
+    // A tap-to-load runs briefly through the auto-load states; show it as loading rather
+    // than asking for a pull.
+    const bool tap_loading = now < ui.toggle_pending_until && ui.toggle_target_loaded;
+    const bool auto_loading = connected && !tap_loading &&
+                              (st.auto_loading() || now < ui.auto_load_pending_until);
     if (!weight_known) {
         lv_label_set_text(ui.lbl_state, "");   // the big link message says it all
     } else if (auto_loading && !loaded) {
@@ -651,6 +655,18 @@ void refresh_main()
     if (set_mode) {
         lv_label_set_text_fmt(ui.lbl_set_num, "%u", (unsigned)st.sets);
         lv_label_set_text_fmt(ui.lbl_rep_num, "%u", (unsigned)st.reps);
+    }
+
+    // With an accessory on, the resistance changes through the rep. During a set the big
+    // number follows it, as on the Voltra, while the cable is moving (between reps the
+    // cable goes slack and the reading falls towards 0) and unless the dial is being
+    // turned, when it shows the base being set.
+    const bool accessory_on = ui.chains > 0 || ui.ecc != 0;
+    const bool moving = st.rep_phase >= 1 && st.rep_phase <= 3;
+    if (set_mode && accessory_on && moving && st.live_force_tenths >= 0 && now >= ui.editing_until) {
+        lv_label_set_text_fmt(ui.lbl_weight, "%d", (st.live_force_tenths + 5) / 10);
+        lv_label_set_text_fmt(ui.lbl_state, "Live  (base %d lb)", ui.weight);
+        lv_obj_set_style_text_color(ui.lbl_state, C_TEXT, 0);
     }
 
     // reps / live force (small line, outside a set)
@@ -735,6 +751,7 @@ void on_center_clicked(lv_event_t *)
     bool loaded = ui.st.loaded();
     ui.toggle_target_loaded = !loaded;
     ui.toggle_pending_until = millis() + TOGGLE_PENDING_MS;
+    // load() picks a plain load or, with the cable pulled out, a direct load.
     if (loaded) c.unload(); else c.load();
     haptics_double();
     refresh_main();

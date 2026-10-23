@@ -29,8 +29,11 @@ Voltra's screen or your phone.
 ## Features
 
 - **Weight on the dial.** Turn slowly for 1 lb steps, spin for 5 lb steps that snap to
-  multiples of 5. The limit is read from the Voltra (230 lb on current firmware).
-- **Load, unload and auto load.** Tap the weight to load or unload. Press and hold it to
+  multiples of 5. The dial stops at the Voltra's own max-weight setting (up to 250 lb),
+  and follows it when you change it on the Voltra.
+- **Load, unload and auto load.** Tap the weight to load or unload. Tapping works with the
+  cable already pulled out too (the Voltra's direct load): the remote checks where the
+  cable is and loads either way. Press and hold it to
   start the Voltra's own auto load: pull the cable out and hold it, and it loads after a
   3-second countdown that the knob shows too.
 - **Always in step with the Voltra.** The screen follows what the Voltra reports, so
@@ -38,6 +41,9 @@ Voltra's screen or your phone.
   unloaded and bright green once loaded, and resting between sets still counts as loaded.
 - **Set screen.** During a set, everything else clears away and the set and rep counts
   fill the lower half. Until the first rep, the rep count pulses like the Voltra's.
+- **Live weight.** With chains, inverse chains, mountain or eccentric on, the big number
+  follows the actual resistance through each rep during a set, as the Voltra's own screen
+  does, with the base weight shown above it.
 - **Two weight presets.** Hold a preset to store the current weight, tap it to send that
   weight. They are stored on the knob and survive a restart.
 - **Accessories** with the Voltra's own icons: eccentric, chains, inverse chains and
@@ -48,10 +54,35 @@ Voltra's screen or your phone.
 
 ## What you need
 
-- A Beyond Power **Voltra I**. Tested against current firmware, with the 230 lb limit.
+- A Beyond Power **Voltra I**. Tested against current firmware, which allows up to 250 lb.
 - A **Waveshare ESP32-S3-Knob-Touch-LCD-1.8**.
 - A USB-C data cable, and a computer with [PlatformIO](https://platformio.org/) (the
   VS Code extension, or the `pio` command line).
+- Optional: a 3D-printed [magnetic backplate](#magnetic-backplate-optional) and three
+  20 × 10 × 3 mm magnets.
+
+## Magnetic backplate (optional)
+
+`backplate/` holds a backplate that adds magnets to the back of the knob, so it can be
+stuck to a steel surface or a matching magnet:
+
+- `backplate.stl`: ready to print.
+- `backplate.scad`: the OpenSCAD source, with every dimension as a named variable at the
+  top.
+
+It is a 60.5 mm disc, 2.5 mm thick, with three slots for magnets arranged in a triangle.
+Four 4.5 mm holes on a 27.3 mm square line up with the screws on the back of the device,
+so they stay reachable with the plate fitted.
+
+**Magnets:** three **20 × 10 × 3 mm rectangular neodymium magnets**, one per slot.
+
+- **Fit:** the slots are 19.5 × 9.7 mm, slightly smaller than the magnets, so they press
+  in. If your printer prints tight or loose, adjust `slot_len` and `slot_wid` in the SCAD
+  file and re-export the STL.
+- **Thickness:** the magnets are 3 mm thick against the plate's 2.5 mm, so they stand
+  0.5 mm proud of one face.
+- **Polarity:** before pressing them in, check that all three face the same way, so the
+  plate pulls evenly against whatever it attaches to.
 
 ## Installing
 
@@ -87,7 +118,7 @@ the connect menu again.
 | Do this | To |
 |---|---|
 | Turn the knob | set the weight (slow: 1 lb, fast: 5 lb) |
-| Tap the weight | load / unload |
+| Tap the weight | load / unload (also with the cable already pulled out) |
 | Press and hold the weight | start auto load; tap again to cancel it before it loads |
 | Tap a preset | send its weight |
 | Press and hold a preset | store the current weight in it |
@@ -123,9 +154,11 @@ five-dot button turns green while any accessory is on.
 | `tools/` | Font and icon generators, the diagnostic sweep generator, and the Poppins font files. |
 | `test/test_protocol/` | Unity tests, mostly against frames captured from the Voltra and the official app. |
 | `docs/PROTOCOL.md` | Everything known about the Voltra's BLE protocol. |
+| `backplate/` | Optional magnetic backplate: printable STL and its OpenSCAD source. |
 
-**Tests.** 25 host-side tests cover the frame builder and parser against captured
-frames, the knob stepping, and the load, auto-load and workout-status logic:
+**Tests.** 28 host-side tests cover the frame builder and parser against captured
+frames, the knob stepping, the load, auto-load and workout-status logic, the weight limit,
+the live weight, and when the cable counts as pulled out:
 
 ```bash
 pio test -e native

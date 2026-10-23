@@ -358,6 +358,57 @@ void test_several_detents_in_one_poll_are_coarse()
     TEST_ASSERT_EQUAL_INT(knobstep::STEP_COARSE_LB, r.step(4, t));
 }
 
+/** Live resistance in rep telemetry (captured at 20 lb base). */
+void test_live_force_from_rep_telemetry()
+{
+    static const struct { const char *hex; int tenths; uint8_t phase; } cases[] = {
+        // 50% chains, top of the pull: the Voltra showed 30
+        {"812b01030002000000e4022c01c002ffff00000000000000000000dcef2100b603000000000000000000002701", 300, 1},
+        // +20% eccentric, lowering: the Voltra showed 24
+        {"812b030400020000002003f3001003a8fe26000000000000000000574722007e040000960000005f000000f000", 243, 3},
+    };
+    for (const auto &c : cases) {
+        uint8_t payload[64];
+        const size_t n = strlen(c.hex) / 2;
+        for (size_t i = 0; i < n; i++) {
+            unsigned b;
+            sscanf(c.hex + 2 * i, "%2x", &b);
+            payload[i] = (uint8_t)b;
+        }
+        Packet pkt = {};
+        pkt.cmd = CMD_TELEMETRY;
+        pkt.payload = payload;
+        pkt.payload_len = n;
+        RepTelemetry rep;
+        TEST_ASSERT_TRUE(parse_rep_telemetry(pkt, rep));
+        TEST_ASSERT_EQUAL(c.tenths, rep.force_tenths_lb);
+        TEST_ASSERT_EQUAL(c.phase, rep.phase);
+        TEST_ASSERT_EQUAL(2, rep.rep_count);
+    }
+}
+
+/** "Pulled out" is measured from the cable length setting (captured at 0, 50 and 38 cm). */
+void test_cable_pulled_out_from_set_length()
+{
+    TEST_ASSERT_FALSE(cable_pulled_out(0, 0));      // length 0, resting
+    TEST_ASSERT_TRUE(cable_pulled_out(44, 0));      // length 0, pulled out
+    TEST_ASSERT_FALSE(cable_pulled_out(50, 50));    // 20 in setting, resting
+    TEST_ASSERT_FALSE(cable_pulled_out(38, 37));    // 15 in setting, resting
+    TEST_ASSERT_TRUE(cable_pulled_out(88, 37));     // 15 in setting, pulled out
+    TEST_ASSERT_FALSE(cable_pulled_out(5, -1));     // setting not read yet: from 0
+    TEST_ASSERT_TRUE(cable_pulled_out(30, -1));
+}
+
+/** The Voltra's max-weight setting (captured at 180, 220 and 250 lb) caps the weight. */
+void test_max_weight_setting()
+{
+    TEST_ASSERT_EQUAL(180, max_weight_from_setting(180));
+    TEST_ASSERT_EQUAL(220, max_weight_from_setting(220));
+    TEST_ASSERT_EQUAL(250, max_weight_from_setting(250));
+    TEST_ASSERT_EQUAL(-1, max_weight_from_setting(0));     // not answered / garbage
+    TEST_ASSERT_EQUAL(-1, max_weight_from_setting(400));
+}
+
 void test_pause_returns_to_fine()
 {
     knobstep::RateTracker r;
@@ -411,6 +462,9 @@ int main(int, char **)
     RUN_TEST(test_direct_load_trigger_frame);
     RUN_TEST(test_auto_load_phases);
     RUN_TEST(test_workout_status_frames);
+    RUN_TEST(test_max_weight_setting);
+    RUN_TEST(test_live_force_from_rep_telemetry);
+    RUN_TEST(test_cable_pulled_out_from_set_length);
     RUN_TEST(test_chains_frame_matches_capture);
     RUN_TEST(test_load_unload_frames_match_captures);
     RUN_TEST(test_param_read_frame_matches_capture);

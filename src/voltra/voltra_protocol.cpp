@@ -319,6 +319,7 @@ bool parse_rep_telemetry(const Packet &pkt, RepTelemetry &out)
     out.set_count = p[3];
     out.rep_count = (uint16_t)((p[4] << 8) | p[5]);   // big-endian
     if (out.rep_count > 10000) return false;
+    out.force_tenths_lb = pkt.payload_len >= 13 ? (int)(p[11] | (p[12] << 8)) : -1;
     return true;
 }
 

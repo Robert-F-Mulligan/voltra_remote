@@ -79,7 +79,11 @@ constexpr uint16_t PARAM_BP_ECCENTRIC_WEIGHT        = 0x3E88;  // i16 eccentric 
 constexpr uint16_t PARAM_BP_SET_FITNESS_MODE        = 0x3E89;  // u16 0 unloaded, 1 loaded idle, 5 set active
 constexpr uint16_t PARAM_BMS_RSOC                   = 0x4E2D;  // u8  battery %
 constexpr uint16_t PARAM_FITNESS_WORKOUT_STATE      = 0x4FB0;  // u8  0 = inactive, 1 = weight training
-constexpr uint16_t PARAM_MC_DEFAULT_OFFLEN_CM       = 0x506A;  // u16 cable offset
+/**
+ * The Voltra's cable length setting, in cm. Captured: 0, 50 (set to 20 in), 37 (15 in).
+ * BP_RUNTIME_POSITION_CM counts from fully retracted, so a resting cable reads this.
+ */
+constexpr uint16_t PARAM_MC_DEFAULT_OFFLEN_CM       = 0x506A;  // u16 cm
 constexpr uint16_t PARAM_FITNESS_ASSIST_MODE        = 0x5106;  // u8
 constexpr uint16_t PARAM_FITNESS_INVERSE_CHAIN      = 0x53B0;  // u8  1 = inverse chains
 
@@ -115,7 +119,26 @@ constexpr uint16_t PARAM_MOUNTAIN_CURVE = 0x556F;   // u8  1 = mountain, 0 = cha
 constexpr uint16_t PARAM_DIRECT_LOAD_SAFETY_CHECK     = 0x538D;  // u8  1 = safety check enabled
 constexpr uint16_t PARAM_DIRECT_LOAD_SAFETY_ST        = 0x53C7;  // u8  progress, see DIRECT_LOAD_ST_*
 constexpr uint16_t PARAM_DIRECT_LOAD_COUNTDOWN_MS     = 0x53C8;  // u16 countdown to load, 3000..0
-constexpr uint16_t PARAM_DIRECT_LOAD_SAFETY_CTRL      = 0x53C9;  // u8  cancel / bypass
+constexpr uint16_t PARAM_DIRECT_LOAD_SAFETY_CTRL      = 0x53C9;  // u8  see DIRECT_LOAD_CTRL_*
+
+// PARAM_DIRECT_LOAD_SAFETY_CTRL values, captured by writing each during an auto load with
+// the cable out: 1 cancelled it (nothing loaded), 2 skipped the countdown and loaded at
+// once (the Voltra's own "direct load"), 3 had no effect.
+constexpr uint8_t DIRECT_LOAD_CTRL_CANCEL = 1;
+constexpr uint8_t DIRECT_LOAD_CTRL_BYPASS = 2;
+
+/**
+ * How far past its set length (PARAM_MC_DEFAULT_OFFLEN_CM) the cable must be to count as
+ * pulled out, when a plain load would be refused. Captured: BP_RUNTIME_POSITION_CM reads the
+ * set length at rest (0, 50, 38 cm) and 40-59 cm beyond it pulled out, also while unloaded.
+ */
+constexpr int CABLE_OUT_MIN_CM = 10;
+
+/** Whether the cable is pulled out past its resting length (rest_cm < 0: not known, use 0). */
+constexpr bool cable_pulled_out(int position_cm, int rest_cm)
+{
+    return position_cm - (rest_cm > 0 ? rest_cm : 0) >= CABLE_OUT_MIN_CM;
+}
 
 /**
  * The Voltra's own lb/% setting for how accessories are shown. Undocumented, found the
@@ -124,9 +147,17 @@ constexpr uint16_t PARAM_DIRECT_LOAD_SAFETY_CTRL      = 0x53C9;  // u8  cancel /
  */
 constexpr uint16_t PARAM_ACCESSORY_DISPLAY_PCT = 0x5569;   // u8  1 = percent, 0 = pounds
 
-// Overdrive raises the target-weight ceiling above the classic 200 lb.
-constexpr uint16_t PARAM_OVERDRIVE_FORCE_MAX    = 0x541E;  // u16 lb, 100..250
-constexpr uint16_t PARAM_OVERDRIVE_AVAILABLE    = 0x5421;  // u8
+/**
+ * The Voltra's own maximum-weight setting, in lb. Captured: it follows the setting on the
+ * Voltra exactly (250 -> 180 -> 220 -> 250). The vendor dictionary says 10..200, which is
+ * out of date: firmware with the 250 lb limit stores 250 here. Not pushed; polled.
+ */
+constexpr uint16_t PARAM_MAX_ALLOWED_FORCE      = 0x5314;  // u16 lb
+
+// Overdrive (the 250 lb upgrade). OVERDRIVE_USER_CFG_FORCE_MAX sounds like the limit but is
+// not answered on current firmware; the limit is PARAM_MAX_ALLOWED_FORCE.
+constexpr uint16_t PARAM_OVERDRIVE_FORCE_MAX    = 0x541E;  // u16 lb, unused
+constexpr uint16_t PARAM_OVERDRIVE_AVAILABLE    = 0x5421;  // u8, 1 on overdrive firmware
 constexpr uint16_t PARAM_OVERDRIVE_ACTIVE       = 0x541D;  // u8
 
 /**
@@ -186,10 +217,16 @@ constexpr uint8_t WORKOUT_STATE_INACTIVE = 0x00;
 constexpr uint8_t WORKOUT_STATE_ACTIVE   = 0x01;   // weight training
 
 constexpr int MIN_TARGET_LB    = 5;
-/** Classic ceiling. Overdrive firmware reports a higher one via PARAM_OVERDRIVE_FORCE_MAX. */
-constexpr int MAX_TARGET_LB          = 230;
-constexpr int MAX_TARGET_LB_CLASSIC  = 200;
-constexpr int MAX_TARGET_LB_OVERDRIVE = 250;
+/** Highest target weight any Voltra I accepts (overdrive firmware). */
+constexpr int MAX_TARGET_LB         = 250;
+/** Ceiling assumed until the Voltra reports its max-weight setting. */
+constexpr int DEFAULT_MAX_TARGET_LB = 230;
+
+/** The weight ceiling a PARAM_MAX_ALLOWED_FORCE reading sets, or -1 if it is not plausible. */
+constexpr int max_weight_from_setting(int lb)
+{
+    return (lb >= MIN_TARGET_LB && lb <= MAX_TARGET_LB) ? lb : -1;
+}
 constexpr int MIN_CHAINS_LB    = 0;
 constexpr int MAX_CHAINS_LB    = 200;
 constexpr int MIN_ECCENTRIC_LB = -200;
@@ -264,6 +301,12 @@ struct RepTelemetry {
     uint8_t set_count;
     uint16_t rep_count;
     uint8_t phase;   // 0 idle, 1 pull, 2 transition, 3 return
+    /**
+     * Live resistance on the cable in 0.1 lb (payload offset 11, u16 LE), -1 if the frame
+     * is too short. Captured: it includes the accessories, e.g. 20 lb with 50% chains
+     * reads 20.5 at the bottom of a rep and 30.0 at the top, matching the Voltra's screen.
+     */
+    int force_tenths_lb;
 };
 bool parse_rep_telemetry(const Packet &pkt, RepTelemetry &out);
 

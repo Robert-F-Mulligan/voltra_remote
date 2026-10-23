@@ -36,6 +36,8 @@ constexpr uint8_t  LOAD_MAX_RETRIES = 4;
 /** Auto load: how long to follow it after the trigger, and how often to read its countdown. */
 constexpr uint32_t AUTO_LOAD_WATCH_MS = 45000;
 constexpr uint32_t AUTO_LOAD_POLL_MS  = 250;
+/** How long a load waits for a fresh cable position before choosing without one. */
+constexpr uint32_t LOAD_CHOOSE_TIMEOUT_MS = 400;
 
 /**
  * Dump raw parameter traffic to the serial log. On only in the diagnostic build
@@ -63,10 +65,11 @@ const uint16_t STATUS_PARAMS[] = {
     PARAM_BMS_RSOC_LEGACY,
     PARAM_BP_RUNTIME_WIRE_WEIGHT_LBS,
     PARAM_BP_RUNTIME_POSITION_CM,
-    PARAM_OVERDRIVE_FORCE_MAX,
+    PARAM_MAX_ALLOWED_FORCE,       // the Voltra's max-weight setting; never pushed
     PARAM_MOUNTAIN_CURVE,      // never pushed by the device, so it must be polled
     PARAM_ACCESSORY_DISPLAY_PCT,   // likewise
     PARAM_DIRECT_LOAD_SAFETY_ST,   // tells a finished auto load from one still waiting
+    PARAM_MC_DEFAULT_OFFLEN_CM,    // cable length setting: where "pulled out" starts
 #if VOLTRA_DIAG
     0x5467,                        // FITNESS_ONGOING_UI: candidate set / rest indicator
 #endif
@@ -337,6 +340,17 @@ void Client::autoLoad()
 {
     lockState();
     req_.auto_load = true;
+    req_.direct_load = false;
+    req_.load = false;
+    req_.unload = false;
+    unlockState();
+}
+
+void Client::directLoad()
+{
+    lockState();
+    req_.auto_load = true;
+    req_.direct_load = true;
     req_.load = false;
     req_.unload = false;
     unlockState();
@@ -454,16 +468,16 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
         log_i("rx %02x [%u] %s", pkt.cmd, (unsigned)pkt.payload_len, hex);
     }
     if (s_log_params && pkt.cmd == CMD_TELEMETRY) {
-        // Workout telemetry streams quickly; log a frame only when its first bytes change.
-        static uint8_t last[12];
+        // Workout telemetry streams quickly; skip only exact repeats of the last frame.
+        static uint8_t last[64];
         static size_t last_len = 0;
         const size_t k = std::min(pkt.payload_len, sizeof(last));
         if (k != last_len || memcmp(last, pkt.payload, k) != 0) {
             memcpy(last, pkt.payload, k);
             last_len = k;
-            static char hex[2 * 40 + 1];
+            static char hex[2 * 64 + 1];
             int o = 0;
-            for (size_t i = 0; i < pkt.payload_len && i < 40; i++) {
+            for (size_t i = 0; i < pkt.payload_len && i < 64; i++) {
                 o += snprintf(hex + o, sizeof(hex) - o, "%02x", pkt.payload[i]);
             }
             log_i("rx aa [%u] %s", (unsigned)pkt.payload_len, hex);
@@ -538,12 +552,12 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
                 if (state_.accessory_display != pct) { state_.accessory_display = pct; changed = true; }
                 break;
             }
-            case PARAM_OVERDRIVE_FORCE_MAX: {
-                // Overdrive firmware raises the ceiling; ignore values below the classic
-                // limit, which is what the device reports when overdrive is not set up.
-                const int ceiling = (v >= MAX_TARGET_LB_CLASSIC && v <= MAX_TARGET_LB_OVERDRIVE)
-                                        ? v : MAX_TARGET_LB;
-                if (state_.max_weight != ceiling) { state_.max_weight = ceiling; changed = true; }
+            case PARAM_MAX_ALLOWED_FORCE: {
+                const int ceiling = max_weight_from_setting(v);
+                if (ceiling > 0 && state_.max_weight != ceiling) {
+                    state_.max_weight = ceiling;
+                    changed = true;
+                }
                 break;
             }
             case PARAM_FITNESS_INVERSE_CHAIN:
@@ -594,7 +608,11 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
             case PARAM_BP_RUNTIME_WIRE_WEIGHT_LBS:
                 if (state_.force_lb != v || !state_.force_known) { state_.force_lb = v; state_.force_known = true; changed = true; }
                 break;
+            case PARAM_MC_DEFAULT_OFFLEN_CM:
+                if (state_.cable_rest_cm != v) { state_.cable_rest_cm = v; changed = true; }
+                break;
             case PARAM_BP_RUNTIME_POSITION_CM:
+                position_read_ms_ = millis();
                 if (state_.position_cm != v) { state_.position_cm = v; changed = true; }
                 break;
             default:
@@ -607,6 +625,13 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
             state_.reps = rep.rep_count;
             state_.sets = rep.set_count;
             state_.rep_phase = rep.phase;
+            changed = true;
+        }
+        // Only whole-pound changes matter on screen; finer ones would just redraw.
+        if (rep.force_tenths_lb >= 0 &&
+            (state_.live_force_tenths < 0 ||
+             (state_.live_force_tenths + 5) / 10 != (rep.force_tenths_lb + 5) / 10)) {
+            state_.live_force_tenths = rep.force_tenths_lb;
             changed = true;
         }
     }
@@ -644,6 +669,20 @@ void Client::enqueue(const uint8_t *data, size_t len)
     q_tail_ = next;
 }
 
+void Client::enqueueFront(const uint8_t *data, size_t len)
+{
+    if (len == 0 || len > sizeof(queue_[0].data)) return;
+    const size_t cap = sizeof(queue_) / sizeof(queue_[0]);
+    const uint8_t prev = (uint8_t)((q_head_ + cap - 1) % cap);
+    if (prev == q_tail_) {
+        log_w("tx queue full, dropping frame");
+        return;
+    }
+    q_head_ = prev;
+    memcpy(queue_[q_head_].data, data, len);
+    queue_[q_head_].len = (uint8_t)len;
+}
+
 void Client::queueBootstrap()
 {
     for (size_t i = 0; i < BOOTSTRAP_FRAME_COUNT; i++) {
@@ -672,6 +711,70 @@ void Client::queueStatusRead()
         size_t n = build_param_read(buf, sizeof(buf), &PERCENT_PARAMS[i], cnt, nextSeq());
         enqueue(buf, n);
     }
+}
+
+// Both load paths put their frames at the front of the queue, so a load goes out within
+// one write slot of the tap instead of waiting behind polls and read-backs. That also
+// keeps the retry timer honest: it starts now, so it must not start while the write is
+// still waiting (a load then looked refused the moment it was sent). Frames are built in
+// order, so sequence numbers still increase, and prepended last-first.
+void Client::enqueueFrontInOrder(Frame *frames, size_t count)
+{
+    for (size_t i = count; i-- > 0;) enqueueFront(frames[i].data, frames[i].len);
+}
+
+void Client::startPlainLoad(uint32_t now)
+{
+    Frame f[2];
+    size_t n = 0;
+    if (state().workout_state <= WORKOUT_STATE_INACTIVE) {
+        f[n].len = (uint8_t)build_param_write_u8(f[n].data, sizeof(f[n].data), PARAM_FITNESS_WORKOUT_STATE,
+                                                 WORKOUT_STATE_ACTIVE, nextSeq());
+        n++;
+    }
+    f[n].len = (uint8_t)build_param_write_u16(f[n].data, sizeof(f[n].data), PARAM_BP_SET_FITNESS_MODE,
+                                              FITNESS_MODE_STRENGTH_LOADED, nextSeq());
+    n++;
+    enqueueFrontInOrder(f, n);
+    guardModeEcho();
+    load_intent_ = true;
+    load_intent_target_ = true;
+    load_retries_ = 0;
+    load_next_retry_ms_ = now + LOAD_RETRY_MS;
+}
+
+/**
+ * Auto load, the same sequence as the Android port's "Direct Load at distance": make sure
+ * weight training is active, trigger, read the status, refresh the stream. With
+ * bypass_countdown it becomes a direct load (see the watch loop).
+ */
+void Client::startAutoLoad(uint32_t now, bool bypass_countdown)
+{
+    static const uint16_t status_ids[] = {PARAM_BP_SET_FITNESS_MODE, PARAM_DIRECT_LOAD_SAFETY_CHECK,
+                                          PARAM_DIRECT_LOAD_SAFETY_ST, PARAM_DIRECT_LOAD_COUNTDOWN_MS,
+                                          PARAM_DIRECT_LOAD_SAFETY_CTRL};
+    const uint8_t trigger[] = {VENDOR_DIRECT_LOAD};
+    const uint8_t refresh[] = {VENDOR_STATE_REFRESH, 0x01};
+    Frame f[4];
+    size_t n = 0;
+    if (state().workout_state <= WORKOUT_STATE_INACTIVE) {
+        f[n].len = (uint8_t)build_param_write_u8(f[n].data, sizeof(f[n].data), PARAM_FITNESS_WORKOUT_STATE,
+                                                 WORKOUT_STATE_ACTIVE, nextSeq());
+        n++;
+    }
+    f[n].len = (uint8_t)build_vendor(f[n].data, sizeof(f[n].data), trigger, sizeof(trigger), nextSeq());
+    n++;
+    f[n].len = (uint8_t)build_param_read(f[n].data, sizeof(f[n].data), status_ids,
+                                         sizeof(status_ids) / sizeof(status_ids[0]), nextSeq());
+    n++;
+    f[n].len = (uint8_t)build_vendor(f[n].data, sizeof(f[n].data), refresh, sizeof(refresh), nextSeq());
+    n++;
+    enqueueFrontInOrder(f, n);
+    load_intent_ = false;
+    auto_load_watch_until_ = now + AUTO_LOAD_WATCH_MS;
+    auto_load_started_ms_ = now;
+    bypass_pending_ = bypass_countdown;
+    last_auto_load_poll_ms_ = now;
 }
 
 void Client::queueParamWriteU16(uint16_t param, uint16_t value)
@@ -945,7 +1048,8 @@ void Client::task()
             bool wrote_setting = false;
             int base = state().weight;
             if (r.has_weight) {
-                base = clampi(r.weight, MIN_TARGET_LB, MAX_TARGET_LB);
+                // never above the Voltra's own max-weight setting
+                base = clampi(r.weight, MIN_TARGET_LB, state().max_weight);
                 queueParamWriteU16(PARAM_BP_BASE_WEIGHT, (uint16_t)base);
                 wrote_setting = true;
             }
@@ -988,38 +1092,23 @@ void Client::task()
                 wrote_setting = true;
             }
             if (r.load) {
-                DeviceState s = state();
-                if (s.workout_state <= WORKOUT_STATE_INACTIVE) {
-                    queueParamWriteU8(PARAM_FITNESS_WORKOUT_STATE, WORKOUT_STATE_ACTIVE);
-                }
-                queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE, FITNESS_MODE_STRENGTH_LOADED);
-                guardModeEcho();
-                load_intent_ = true;
-                load_intent_target_ = true;
-                load_retries_ = 0;
-                load_next_retry_ms_ = now + LOAD_RETRY_MS;
+                // The cable position picks the kind of load (see below); read it fresh, since
+                // the periodic poll can be 3 s old, and ahead of anything queued so the load
+                // is not held up.
+                // The cable length setting comes along: "pulled out" is measured from it.
+                const uint16_t pos[] = {PARAM_MC_DEFAULT_OFFLEN_CM, PARAM_BP_RUNTIME_POSITION_CM};
+                uint8_t buf[32];
+                enqueueFront(buf, build_param_read(buf, sizeof(buf), pos, 2, nextSeq()));
+                load_choosing_ = true;
+                load_choose_deadline_ = now + LOAD_CHOOSE_TIMEOUT_MS;
+                load_intent_ = false;
                 wrote_setting = true;
             }
-            if (r.auto_load) {
-                // Same sequence as the Android port's "Direct Load at distance": make sure
-                // weight training is active, trigger, read the status, refresh the stream.
-                DeviceState s = state();
-                if (s.workout_state <= WORKOUT_STATE_INACTIVE) {
-                    queueParamWriteU8(PARAM_FITNESS_WORKOUT_STATE, WORKOUT_STATE_ACTIVE);
-                }
-                uint8_t buf[32];
-                const uint8_t trigger[] = {VENDOR_DIRECT_LOAD};
-                enqueue(buf, build_vendor(buf, sizeof(buf), trigger, sizeof(trigger), nextSeq()));
-                queueDirectLoadRead();
-                const uint8_t refresh[] = {VENDOR_STATE_REFRESH, 0x01};
-                enqueue(buf, build_vendor(buf, sizeof(buf), refresh, sizeof(refresh), nextSeq()));
-                load_intent_ = false;
-                auto_load_watch_until_ = now + AUTO_LOAD_WATCH_MS;
-                auto_load_started_ms_ = now;
-                last_auto_load_poll_ms_ = now;
-            }
+            if (r.auto_load) startAutoLoad(now, r.direct_load);
             if (r.unload) {
                 auto_load_watch_until_ = 0;
+                bypass_pending_ = false;
+                load_choosing_ = false;
                 queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE, FITNESS_MODE_STRENGTH_READY);
                 guardModeEcho();
                 load_intent_ = true;
@@ -1073,6 +1162,18 @@ void Client::task()
             // The Voltra advances 0 -> 1 -> 5 one command at a time, so a single write
             // frequently stops at an intermediate state. Keep re-issuing until the
             // reported mode matches what the user asked for.
+            // Load: a plain load with the cable in (fast, no auto-load screen); with it
+            // pulled out a plain load is refused, so a direct load instead.
+            if (load_choosing_) {
+                const bool fresh = (int32_t)(position_read_ms_ - (load_choose_deadline_ - LOAD_CHOOSE_TIMEOUT_MS)) >= 0;
+                if (fresh || (int32_t)(now - load_choose_deadline_) >= 0) {
+                    load_choosing_ = false;
+                    const DeviceState s = state();
+                    if (cable_pulled_out(s.position_cm, s.cable_rest_cm)) startAutoLoad(now, true);
+                    else startPlainLoad(now);
+                }
+            }
+
             if (load_intent_ && queueEmpty() && (int32_t)(now - load_next_retry_ms_) >= 0) {
                 const int mode = reportedMode();
                 // A load is finished at an active set (5); an unload only once the device
@@ -1082,6 +1183,14 @@ void Client::task()
                                       : mode >= 0 && !voltra_loaded(mode, state().direct_load_status);
                 if (done) {
                     load_intent_ = false;
+                } else if (load_intent_target_ && mode >= 0 && (mode & 0xFF) == FITNESS_MODE_UNLOADED &&
+                           state().workout_status <= WORKOUT_STATUS_UNLOADED) {
+                    // Refused outright: with the cable out the Voltra drops back to 0 and its
+                    // workout status never leaves "unloaded". (The mode alone can read 0 for a
+                    // load that worked, when its push fell in the echo guard window.)
+                    log_i("load refused (cable out?), direct load instead");
+                    load_intent_ = false;
+                    startAutoLoad(now, true);
                 } else if (load_retries_ < LOAD_MAX_RETRIES) {
                     load_retries_++;
                     log_i("%s retry %u (mode=%d)", load_intent_target_ ? "load" : "unload",
@@ -1104,13 +1213,14 @@ void Client::task()
             // Diagnostic sweep: read every BP/MC register so snapshots taken in different
             // device states can be diffed offline to find undocumented registers.
             if (conn == ConnState::Ready) {
-                if (!sweep_active_ && !auto_load_watch_until_ && (int32_t)(now - sweep_next_ms_) >= 0) {
+                const bool loading = auto_load_watch_until_ || load_choosing_ || load_intent_;
+                if (!sweep_active_ && !loading && (int32_t)(now - sweep_next_ms_) >= 0) {
                     sweep_active_ = true;
                     sweep_pos_ = 0;
                     log_i("sweep begin (%u params)", (unsigned)SWEEP_PARAM_COUNT);
                 }
                 const bool poll_due = now - last_poll_ms_ >= STATUS_POLL_MS;
-                while (sweep_active_ && !auto_load_watch_until_ && !poll_due &&
+                while (sweep_active_ && !loading && !poll_due &&
                        queueDepth() < SWEEP_MAX_QUEUE) {
                     const size_t cnt = std::min(SWEEP_CHUNK, SWEEP_PARAM_COUNT - sweep_pos_);
                     uint8_t buf[64];
@@ -1134,6 +1244,21 @@ void Client::task()
                 // mode only changes after the trigger has gone out.
                 const bool finished = now - auto_load_started_ms_ > 2000 && s.loaded() &&
                                       !s.auto_loading() && s.direct_load_countdown_ms == 0;
+                // Direct load: as soon as the Voltra reports the auto load waiting (or
+                // counting down), bypass the countdown. Captured: it loads ~0.4 s later.
+                if (bypass_pending_ && s.auto_loading() &&
+                    (s.direct_load_status == DIRECT_LOAD_ST_WAITING ||
+                     s.direct_load_status == DIRECT_LOAD_ST_COUNTDOWN)) {
+                    // At the front, like the load itself: it is what the user is waiting on.
+                    static const uint16_t status_ids[] = {PARAM_BP_SET_FITNESS_MODE, PARAM_DIRECT_LOAD_SAFETY_ST};
+                    Frame f[2];
+                    f[0].len = (uint8_t)build_param_write_u8(f[0].data, sizeof(f[0].data),
+                                                             PARAM_DIRECT_LOAD_SAFETY_CTRL,
+                                                             DIRECT_LOAD_CTRL_BYPASS, nextSeq());
+                    f[1].len = (uint8_t)build_param_read(f[1].data, sizeof(f[1].data), status_ids, 2, nextSeq());
+                    enqueueFrontInOrder(f, 2);
+                    bypass_pending_ = false;
+                }
                 if (expired || finished) {
                     auto_load_watch_until_ = 0;
                 } else if (queueEmpty() && now - last_auto_load_poll_ms_ >= AUTO_LOAD_POLL_MS) {

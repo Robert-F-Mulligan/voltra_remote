@@ -53,7 +53,7 @@ struct DeviceState {
     int mountain = -1;         // 1 on / 0 off / -1 unknown
     /** The Voltra's lb/% display setting for accessories: 1 = percent, 0 = pounds, -1 unknown. */
     int accessory_display = -1;
-    int max_weight = MAX_TARGET_LB;   // effective ceiling, raised by overdrive firmware
+    int max_weight = DEFAULT_MAX_TARGET_LB;   // the Voltra's max-weight setting, lb
     int max_chains_pct = 100;  // device limit when in percent mode
     int max_ecc_pct = 60;      // device limit when in percent mode
     int fitness_mode = -1;     // raw PARAM_BP_SET_FITNESS_MODE
@@ -64,9 +64,11 @@ struct DeviceState {
     int force_lb = 0;
     bool force_known = false;
     int position_cm = 0;
+    int cable_rest_cm = -1;   // the Voltra's cable length setting; -1 not read yet
     uint16_t reps = 0;
     uint8_t sets = 0;
     uint8_t rep_phase = 0;
+    int live_force_tenths = -1;   // live resistance from rep telemetry, 0.1 lb; -1 unknown
     int workout_status = -1;   // WORKOUT_STATUS_*, -1 not seen yet
     uint32_t last_rx_ms = 0;
 
@@ -108,6 +110,12 @@ public:
     void unload();
     /** Start the Voltra's auto load: it loads once the cable is pulled out and held. */
     void autoLoad();
+    /**
+     * Load straight away with the cable already pulled out (the Voltra's "direct load").
+     * A plain load is refused then, so this starts an auto load and bypasses its countdown.
+     * If the bypass does not take, it is an auto load. load() picks this by itself.
+     */
+    void directLoad();
     void refresh();
 
     // --- state --------------------------------------------------------------
@@ -137,6 +145,7 @@ private:
         bool load = false;
         bool unload = false;
         bool auto_load = false;
+        bool direct_load = false;   // with auto_load: bypass the countdown
         bool has_weight = false;
         bool has_chains = false;
         bool has_eccentric = false;
@@ -169,6 +178,9 @@ private:
     bool doConnect(const std::string &addr, uint8_t addr_type);
     void teardown();
     void enqueue(const uint8_t *data, size_t len);
+    /** Queue a frame ahead of everything waiting, for reads a user action is blocked on. */
+    void enqueueFront(const uint8_t *data, size_t len);
+    void enqueueFrontInOrder(Frame *frames, size_t count);
     bool queueEmpty() const { return q_head_ == q_tail_; }
     size_t queueDepth() const
     {
@@ -217,6 +229,14 @@ private:
     /** While set, poll the auto-load countdown quickly so the screen can count along. */
     uint32_t auto_load_watch_until_ = 0;
     uint32_t auto_load_started_ms_ = 0;
+    // Direct load: bypass the auto-load countdown once the Voltra reports it is waiting.
+    bool bypass_pending_ = false;
+    // A load waits for a fresh cable position to choose a plain or a direct load.
+    bool load_choosing_ = false;
+    uint32_t load_choose_deadline_ = 0;
+    uint32_t position_read_ms_ = 0;   // when BP_RUNTIME_POSITION_CM was last read
+    void startPlainLoad(uint32_t now);
+    void startAutoLoad(uint32_t now, bool bypass_countdown);
     uint32_t last_auto_load_poll_ms_ = 0;
     void queueDirectLoadRead();
 
