@@ -22,12 +22,15 @@ using voltra::FoundDevice;
 
 namespace {
 
+// Offline development build: all BLE control paths are disabled.
+#define VOLTRA_UI_DEMO 0
+
 // ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
-#define C_BG       lv_color_hex(0x000000)
-#define C_CARD     lv_color_hex(0x111827)
-#define C_TRACK    lv_color_hex(0x1f2937)
+#define C_BG       lv_color_hex(0x080d18)
+#define C_CARD     lv_color_hex(0x172337)
+#define C_TRACK    lv_color_hex(0x28364b)
 #define C_TEXT     lv_color_hex(0xf8fafc)
 #define C_MUTED    lv_color_hex(0x94a3b8)
 #define C_UNLOADED lv_color_hex(0x3b82f6)
@@ -35,8 +38,9 @@ namespace {
 // Unloaded, as on the Voltra: the weight in a muted green and the ring in grey.
 #define C_IDLE_NUM  lv_color_hex(0x29320d)
 #define C_IDLE_RING lv_color_hex(0x6b7280)
-#define C_CHAINS   lv_color_hex(0xa78bfa)
-#define C_ECC      lv_color_hex(0xf472b6)
+#define C_CHAINS   lv_color_hex(0x4ed8d0)
+#define C_ECC      lv_color_hex(0xffae72)
+#define C_ECC_NEG  lv_color_hex(0x8ab4ff)
 #define C_WARN     lv_color_hex(0xf59e0b)
 #define C_DANGER   lv_color_hex(0xef4444)
 // Same colours as text for label recolour markup ("#rrggbb text#").
@@ -62,7 +66,7 @@ constexpr uint32_t EDIT_HOLD_MS = 900;
 constexpr uint32_t TOGGLE_PENDING_MS = 5000;
 constexpr uint32_t AUTO_LOAD_PENDING_MS = 4000;
 
-enum class Screen { Main, Settings, AdjustChains, AdjustEcc, Connect };
+enum class Screen { Main, Settings, AdjustChains, AdjustEcc, Connect, DropSets, Features };
 
 /**
  * Chains, inverse chains and mountain are one accessory in three styles: the Voltra
@@ -78,6 +82,7 @@ enum SettingsRow : intptr_t {
     ROW_ECCENTRIC,
     ROW_MOUNTAIN,
     ROW_CLOSE,
+    ROW_FEATURES,
 };
 
 struct Ui {
@@ -100,6 +105,9 @@ struct Ui {
     lv_obj_t *row_weight = nullptr;      // the weight number and its unit
     lv_obj_t *lbl_link = nullptr;        // "Not Connected" / "Connecting..." in place of the weight
     lv_obj_t *lbl_state = nullptr;
+    lv_obj_t *countdown_overlay = nullptr;
+    lv_obj_t *countdown_number = nullptr;
+    lv_obj_t *countdown_caption = nullptr;
     lv_obj_t *btn_gear = nullptr;
     lv_obj_t *lbl_gear = nullptr;
     // active accessories either side of the settings button: eccentric left, chain style right
@@ -131,6 +139,11 @@ struct Ui {
     };
     Bubble bub_ecc, bub_chains, bub_mountain, bub_inverse;
     lv_obj_t *btn_settings_done = nullptr;
+    lv_obj_t *scr_features = nullptr;
+    lv_obj_t *btn_drop_toggle = nullptr;
+    lv_obj_t *lbl_drop_toggle = nullptr;
+    lv_obj_t *btn_home_drop = nullptr;
+    bool drop_enabled = false; // planner only; never executes drops
 
     // adjust
     lv_obj_t *scr_adjust = nullptr;
@@ -141,6 +154,17 @@ struct Ui {
     lv_obj_t *lbl_adj_unit = nullptr;
     lv_obj_t *lbl_adj_range = nullptr;
     lv_obj_t *btn_done = nullptr;
+
+    // Offline drop-set planner: configuration and preview only, no BLE actions.
+    lv_obj_t *scr_drops = nullptr;
+    lv_obj_t *lbl_drop_pct = nullptr;
+    lv_obj_t *lbl_drop_count = nullptr;
+    lv_obj_t *lbl_drop_preview = nullptr;
+    lv_obj_t *btn_drop_pct = nullptr;
+    lv_obj_t *btn_drop_count = nullptr;
+    int drop_pct = 20;     // 5..50 percent of preceding step
+    int drop_count = 3;    // 1..5 drops
+    bool editing_drop_pct = true;
 
     // connect
     lv_obj_t *scr_connect = nullptr;
@@ -243,7 +267,7 @@ const char *style_name(ChainStyle s)
     }
 }
 
-lv_color_t style_colour(ChainStyle s) { return s == ChainStyle::Mountain ? C_WARN : C_CHAINS; }
+lv_color_t style_colour(ChainStyle s) { return s == ChainStyle::Mountain ? C_WARN : s == ChainStyle::Inverse ? lv_color_hex(0x8b5cf6) : C_CHAINS; }
 
 /** Style the device flags describe. Both flags set is not a state the Voltra's UI makes. */
 ChainStyle device_style(const DeviceState &st)
@@ -260,6 +284,8 @@ void show(Screen s)
     if (s == Screen::Settings) scr = ui.scr_settings;
     if (s == Screen::AdjustChains || s == Screen::AdjustEcc) scr = ui.scr_adjust;
     if (s == Screen::Connect) scr = ui.scr_connect;
+    if (s == Screen::DropSets) scr = ui.scr_drops;
+    if (s == Screen::Features) scr = ui.scr_features;
     lv_scr_load_anim(scr, LV_SCR_LOAD_ANIM_FADE_IN, 120, 0, false);
 }
 
@@ -295,8 +321,8 @@ lv_obj_t *make_ring(lv_obj_t *parent, lv_color_t color)
     lv_obj_center(arc);
     lv_arc_set_bg_angles(arc, 135, 405);
     lv_arc_set_rotation(arc, 0);
-    lv_obj_set_style_arc_width(arc, 14, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arc, 14, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arc, 11, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, 11, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(arc, C_TRACK, LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc, color, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
@@ -421,6 +447,11 @@ void mark_ecc_changed()
 
 void flush_pending(uint32_t now)
 {
+#if VOLTRA_UI_DEMO
+    // Local edits only. Never transmit commands to a resistance device.
+    (void)now;
+    return;
+#endif
     VClient &c = VClient::instance();
     if (ui.w_dirty && now - ui.w_changed >= SEND_DEBOUNCE_MS) {
         ui.w_dirty = false;
@@ -514,11 +545,13 @@ void refresh_presets()
     for (auto &pr : ui.presets) {
         if (pr.lb > 0) {
             lv_label_set_text_fmt(pr.value, "%d", pr.lb);
+            lv_obj_set_style_text_font(pr.value, &font_poppins_20, 0);
             lv_obj_set_style_text_color(pr.value, C_TEXT, 0);
             lv_obj_clear_flag(pr.unit, LV_OBJ_FLAG_HIDDEN);
             lv_obj_align(pr.value, LV_ALIGN_CENTER, 0, -6);
         } else {
-            lv_label_set_text(pr.value, "+");
+            lv_label_set_text(pr.value, "SAVE");
+            lv_obj_set_style_text_font(pr.value, &font_poppins_14, 0);
             lv_obj_set_style_text_color(pr.value, C_MUTED, 0);
             lv_obj_add_flag(pr.unit, LV_OBJ_FLAG_HIDDEN);
             lv_obj_align(pr.value, LV_ALIGN_CENTER, 0, 0);
@@ -563,7 +596,7 @@ void make_preset(int i, int x, int y)
     // press, which would apply the preset that was just stored.
     lv_obj_add_event_cb(pr.btn, on_preset_tap, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
     lv_obj_add_event_cb(pr.btn, on_preset_hold, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
-    pr.value = make_label(pr.btn, &font_poppins_20, C_TEXT, "+");
+    pr.value = make_label(pr.btn, &font_poppins_14, C_MUTED, "SAVE");
     lv_obj_align(pr.value, LV_ALIGN_CENTER, 0, -6);
     pr.unit = make_label(pr.btn, &font_poppins_14, C_MUTED, "lb");
     lv_obj_align(pr.unit, LV_ALIGN_CENTER, 0, 13);
@@ -578,7 +611,7 @@ void refresh_main()
 
     // ring + weight. Until the Voltra has reported its weight there is no weight to show,
     // so the link state takes its place.
-    const bool weight_known = ready && st.weight >= voltra::MIN_TARGET_LB;
+    const bool weight_known = VOLTRA_UI_DEMO || (ready && st.weight >= voltra::MIN_TARGET_LB);
     lv_arc_set_range(ui.arc_weight, voltra::MIN_TARGET_LB, weight_max());
     lv_arc_set_value(ui.arc_weight, weight_known ? ui.weight : voltra::MIN_TARGET_LB);
     lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
@@ -589,7 +622,7 @@ void refresh_main()
     bool loaded = st.loaded();
     bool pending = now < ui.toggle_pending_until && loaded != ui.toggle_target_loaded;
     lv_color_t ring = loaded ? C_LOADED : C_IDLE_RING;
-    if (!connected) ring = C_TRACK;
+    if (!connected) ring = VOLTRA_UI_DEMO ? C_CHAINS : C_TRACK;
     lv_obj_set_style_arc_color(ui.arc_weight, ring, LV_PART_INDICATOR);
 
     // A tap-to-load runs briefly through the auto-load states; show it as loading rather
@@ -597,7 +630,11 @@ void refresh_main()
     const bool tap_loading = now < ui.toggle_pending_until && ui.toggle_target_loaded;
     const bool auto_loading = connected && !tap_loading &&
                               (st.auto_loading() || now < ui.auto_load_pending_until);
-    if (!weight_known) {
+    if (VOLTRA_UI_DEMO) {
+        lv_label_set_text(ui.lbl_state, "PREVIEW ONLY  |  LOAD DISABLED");
+        lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, C_TEXT, 0);
+    } else if (!weight_known) {
         lv_label_set_text(ui.lbl_state, "");   // the big link message says it all
     } else if (auto_loading && !loaded) {
         // The Voltra's auto load: waiting for the cable to be pulled out and held, then
@@ -625,6 +662,25 @@ void refresh_main()
         lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
     }
 
+    // Full-dial auto-load countdown: display only the device-reported time.
+    // No synthetic countdown: stale/missing telemetry must never imply loading is imminent.
+    const int load_ms = st.direct_load_countdown_ms;
+    const bool count_visible = !VOLTRA_UI_DEMO && ready && !loaded &&
+                               auto_loading && st.auto_loading() &&
+                               st.direct_load_status == voltra::DIRECT_LOAD_ST_COUNTDOWN &&
+                               load_ms > 0 && load_ms <= 3000 &&
+                               (now - st.last_rx_ms < 1200);
+    set_obj_hidden(ui.countdown_overlay, !count_visible);
+    if (count_visible) {
+        const int seconds = (load_ms + 999) / 1000;
+        lv_label_set_text_fmt(ui.countdown_number, "%d", seconds);
+        lv_label_set_text(ui.countdown_caption, "AUTO LOAD");
+        const bool pulse = (now / 250) % 2 == 0;
+        lv_obj_set_style_bg_color(ui.countdown_overlay,
+                                  pulse ? C_WARN : lv_color_hex(0x9a3412), 0);
+        lv_obj_move_foreground(ui.countdown_overlay);
+    }
+
     // top bar: Bluetooth icon (blue when connected, white when not) and, once connected,
     // the Voltra's battery level. Recolour markup colours just the icon.
     char top[64];
@@ -637,6 +693,11 @@ void refresh_main()
         snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#   %s %d%%", bt_hex, sym, st.battery);
     } else {
         snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#", bt_hex);
+    }
+    if (VOLTRA_UI_DEMO) snprintf(top, sizeof(top), "VOLTRA LAB  /  v0.7 DEMO");
+    if (ui.btn_home_drop) {
+        /* Drop sets retired: shortcut stays hidden. */
+        lv_obj_add_flag(ui.btn_home_drop, LV_OBJ_FLAG_HIDDEN);
     }
     lv_label_set_text(ui.lbl_top, top);
     lv_obj_set_style_text_color(ui.lbl_top, C_TEXT, 0);
@@ -688,16 +749,19 @@ void refresh_main()
     const bool any_accessory = ui.chains > 0 || ui.ecc != 0;
     lv_obj_set_style_text_color(ui.lbl_gear, any_accessory ? C_LOADED : C_TEXT, 0);
 
-    // eccentric chip (left)
-    if (ui.ecc != 0) {
+    // Eccentric is on the right; negative values get a cool accent.
+    if (ready || VOLTRA_UI_DEMO) {
+        const lv_color_t ecc_col = ui.ecc < 0 ? C_ECC_NEG : C_ECC;
+        lv_obj_set_style_text_color(ui.chip_ecc.icon, ecc_col, 0);
+        lv_obj_set_style_border_color(ui.chip_ecc.btn, ecc_col, 0);
         set_chip_values(ui.chip_ecc, ui.ecc, true);
         lv_obj_clear_flag(ui.chip_ecc.btn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(ui.chip_ecc.btn, LV_OBJ_FLAG_HIDDEN);
     }
 
-    // chains / inverse chains / mountain chip (right), whichever style is live
-    if (ui.chains > 0) {
+    // Chains / inverse chains / mountain chip (left), whichever style is live
+    if (ready || VOLTRA_UI_DEMO) {
         const char *icon = ui.style == ChainStyle::Inverse ? ICON_INVERSE
                          : ui.style == ChainStyle::Mountain ? ICON_MOUNTAIN : ICON_CHAINS;
         const lv_color_t col = style_colour(ui.style);
@@ -705,7 +769,7 @@ void refresh_main()
         lv_obj_set_style_text_color(ui.chip_chain.icon, col, 0);
         lv_obj_set_style_border_color(ui.chip_chain.btn, col, 0);
         lv_obj_set_style_bg_color(ui.chip_chain.btn, col, LV_STATE_PRESSED);
-        set_chip_values(ui.chip_chain, ui.chains, false);
+        set_chip_values(ui.chip_chain, ui.style == ChainStyle::Inverse ? -ui.chains : ui.chains, true);
         lv_obj_clear_flag(ui.chip_chain.btn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(ui.chip_chain.btn, LV_OBJ_FLAG_HIDDEN);
@@ -715,8 +779,7 @@ void refresh_main()
 
     if (set_mode) {
         lv_obj_add_flag(ui.btn_gear, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ui.chip_ecc.btn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ui.chip_chain.btn, LV_OBJ_FLAG_HIDDEN);
+        // Keep modifier chips visible throughout a set.
         for (auto &pr : ui.presets) lv_obj_add_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(ui.btn_gear, LV_OBJ_FLAG_HIDDEN);
@@ -727,6 +790,10 @@ void refresh_main()
 
 void on_center_clicked(lv_event_t *)
 {
+#if VOLTRA_UI_DEMO
+    haptics_buzz(); // Never load in offline preview.
+    return;
+#endif
     VClient &c = VClient::instance();
     if (!ui.st.connected()) {
         haptics_click();
@@ -760,6 +827,10 @@ void on_center_clicked(lv_event_t *)
 /** Press and hold: start the Voltra's auto load (loads once the cable is pulled and held). */
 void on_center_hold(lv_event_t *)
 {
+#if VOLTRA_UI_DEMO
+    haptics_buzz();
+    return;
+#endif
     if (ui.st.conn != ConnState::Ready || ui.st.loaded() || ui.st.auto_loading()) {
         haptics_buzz();
         return;
@@ -774,6 +845,11 @@ void on_center_hold(lv_event_t *)
 
 void on_top_clicked(lv_event_t *)
 {
+#if VOLTRA_UI_DEMO
+    haptics_click();
+    show(Screen::DropSets);
+    return;
+#endif
     haptics_click();
     show(Screen::Connect);
     VClient::instance().scanStart();
@@ -816,7 +892,6 @@ void build_main()
 {
     ui.scr_main = make_screen();
     ui.arc_weight = make_ring(ui.scr_main, C_IDLE_RING);
-
     // top bar (tap -> connect menu)
     ui.btn_top = make_flat_button(ui.scr_main, 220, 44);
     lv_obj_align(ui.btn_top, LV_ALIGN_TOP_MID, 0, 20);
@@ -881,7 +956,7 @@ void build_main()
     lv_obj_align(ui.lbl_link, LV_ALIGN_CENTER, 0, 0);
     lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);   // 8 px higher on screen than before
     ui.lbl_state = make_label(ui.btn_center, &font_poppins_14, C_MUTED, "");
-    lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 1);
 
     ui.btn_gear = make_pill_button(ui.scr_main, 64, 64, C_TRACK, "", nullptr);
     lv_obj_align(ui.btn_gear, LV_ALIGN_CENTER, 0, 114);
@@ -889,10 +964,26 @@ void build_main()
     ui.lbl_gear = make_label(ui.btn_gear, &font_icons_26, C_TEXT, ICON_SETTINGS);
     lv_obj_center(ui.lbl_gear);
 
+    // High-contrast full-dial countdown. Non-clickable so the original
+    // centre load/unload gesture remains the only load control.
+    ui.countdown_overlay = lv_obj_create(ui.scr_main);
+    lv_obj_remove_style_all(ui.countdown_overlay);
+    lv_obj_set_size(ui.countdown_overlay, 360, 360);
+    lv_obj_align(ui.countdown_overlay, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(ui.countdown_overlay, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(ui.countdown_overlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(ui.countdown_overlay, C_WARN, 0);
+    lv_obj_clear_flag(ui.countdown_overlay, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    ui.countdown_number = make_label(ui.countdown_overlay, &font_poppins_96, C_TEXT, "3");
+    lv_obj_align(ui.countdown_number, LV_ALIGN_CENTER, 0, -12);
+    ui.countdown_caption = make_label(ui.countdown_overlay, &font_poppins_22, C_TEXT, "AUTO LOAD");
+    lv_obj_align(ui.countdown_caption, LV_ALIGN_CENTER, 0, 84);
+    lv_obj_add_flag(ui.countdown_overlay, LV_OBJ_FLAG_HIDDEN);
+
     // Chips for the active accessories, shown only while on. Kept inside the ring: the
     // outer edge is ~156 px from centre against the ring's 158 px.
-    make_chip(ui.chip_ecc, ICON_ECCENTRIC, C_ECC, -74, 96);
-    make_chip(ui.chip_chain, ICON_CHAINS, C_CHAINS, 74, 96);
+    make_chip(ui.chip_chain, ICON_CHAINS, C_CHAINS, -74, 96);
+    make_chip(ui.chip_ecc, ICON_ECCENTRIC, C_ECC, 74, 96);
 
     // Weight presets at the sides, just below the weight's baseline. Outer edge ~151 px
     // from centre against the ring's 158 px.
@@ -900,6 +991,15 @@ void build_main()
     make_preset(0, -122, 30);
     make_preset(1, 122, 30);
     refresh_presets();
+
+    // Only visible when enabled in Settings > Features. Planner remains offline-only.
+    ui.btn_home_drop = make_pill_button(ui.scr_main, 86, 30, C_CHAINS, "DROPS", nullptr);
+    lv_obj_align(ui.btn_home_drop, LV_ALIGN_CENTER, 0, -116);
+    lv_obj_add_event_cb(ui.btn_home_drop, [](lv_event_t *) {
+        haptics_click();
+        show(Screen::DropSets);
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_flag(ui.btn_home_drop, LV_OBJ_FLAG_HIDDEN);
 
     // knob battery (bottom, inside the gap at the bottom of the ring)
     ui.lbl_kbat = make_label(ui.scr_main, &font_poppins_14, C_MUTED, "");
@@ -915,15 +1015,16 @@ void refresh_adjust()
     lv_label_set_text(ui.lbl_adj_unit, accessory_unit());
     if (chains) {
         int mx = chains_max();
-        const int v = style_amount(ui.adj_style);
-        const lv_color_t col = style_colour(ui.adj_style);
-        lv_label_set_text(ui.lbl_adj_title, style_name(ui.adj_style));
+        const bool signed_chain = ui.adj_return == Screen::Main && ui.adj_style != ChainStyle::Mountain;
+        const int v = signed_chain && ui.style == ChainStyle::Inverse ? -ui.chains : style_amount(ui.adj_style);
+        const lv_color_t col = signed_chain ? style_colour(v < 0 ? ChainStyle::Inverse : ChainStyle::Chains) : style_colour(ui.adj_style);
+        lv_label_set_text(ui.lbl_adj_title, signed_chain ? (v < 0 ? "Inverse Chains" : "Chains") : style_name(ui.adj_style));
         lv_obj_set_style_text_color(ui.lbl_adj_title, col, 0);
         lv_obj_set_style_arc_color(ui.arc_adj, col, LV_PART_INDICATOR);
         lv_arc_set_mode(ui.arc_adj, LV_ARC_MODE_NORMAL);
-        lv_arc_set_range(ui.arc_adj, 0, std::max(mx, STEP_COARSE_LB));
+        lv_arc_set_range(ui.arc_adj, signed_chain ? -std::max(mx, STEP_COARSE_LB) : 0, std::max(mx, STEP_COARSE_LB));
         lv_arc_set_value(ui.arc_adj, v);
-        lv_label_set_text_fmt(ui.lbl_adj_val, "%d", v);
+        lv_label_set_text_fmt(ui.lbl_adj_val, signed_chain ? "%+d" : "%d", v);
         if (lb_mode()) {
             lv_label_set_text_fmt(ui.lbl_adj_range, "0 - %d lb   =  %d%% of %d lb",
                                   mx, amount_pct(v), ui.weight);
@@ -934,17 +1035,18 @@ void refresh_adjust()
     } else {
         int mx = ecc_max();
         lv_label_set_text(ui.lbl_adj_title, "Eccentric");
-        lv_obj_set_style_text_color(ui.lbl_adj_title, C_ECC, 0);
-        lv_obj_set_style_arc_color(ui.arc_adj, C_ECC, LV_PART_INDICATOR);
+        const lv_color_t ecc_col = ui.ecc < 0 ? C_ECC_NEG : C_ECC;
+        lv_obj_set_style_text_color(ui.lbl_adj_title, ecc_col, 0);
+        lv_obj_set_style_arc_color(ui.arc_adj, ecc_col, LV_PART_INDICATOR);
         lv_arc_set_mode(ui.arc_adj, LV_ARC_MODE_SYMMETRICAL);
         lv_arc_set_range(ui.arc_adj, -std::max(mx, STEP_COARSE_LB), std::max(mx, STEP_COARSE_LB));
         lv_arc_set_value(ui.arc_adj, ui.ecc);
         lv_label_set_text_fmt(ui.lbl_adj_val, "%+d", ui.ecc);
         if (lb_mode()) {
-            lv_label_set_text_fmt(ui.lbl_adj_range, "-%d - +%d lb   =  %+d%% of %d lb",
+            lv_label_set_text_fmt(ui.lbl_adj_range, "-%d to +%d lb  |  %+d%% of %d lb",
                                   mx, mx, amount_pct(ui.ecc), ui.weight);
         } else {
-            lv_label_set_text_fmt(ui.lbl_adj_range, "-%d - +%d%%   =  %+d lb of %d lb",
+            lv_label_set_text_fmt(ui.lbl_adj_range, "-%d to +%d%%  |  %+d lb of %d lb",
                                   mx, mx, pct_to_lb(ui.ecc), ui.weight);
         }
     }
@@ -1013,6 +1115,9 @@ void on_settings_row(lv_event_t *e)
             show(Screen::AdjustEcc);
             refresh_adjust();
             break;
+        case ROW_FEATURES:
+            show(Screen::Features);
+            break;
         case ROW_CLOSE:
         default:
             show(Screen::Main);
@@ -1074,9 +1179,6 @@ void build_settings()
     lv_obj_t *ring = make_ring(ui.scr_settings, C_TRACK);
     lv_arc_set_value(ring, 0);
 
-    lv_obj_t *title = make_label(ui.scr_settings, &font_poppins_18, C_TEXT, "SETTINGS");
-    lv_obj_set_style_text_letter_space(title, 2, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
 
     // 2x2 grid, in the order eccentric, chains / mountain, inverse chains. Kept inside the
     // ring: the farthest bubble edge is ~126 px from centre against the ring's 158 px.
@@ -1085,6 +1187,13 @@ void build_settings()
     make_bubble(ui.bub_mountain, ICON_MOUNTAIN,  "Mountain",  ROW_MOUNTAIN,  -52,  58);
     make_bubble(ui.bub_inverse,  ICON_INVERSE,   "Inverse",   ROW_INVERSE,    52,  58);
 
+    // Feature options live on a separate page to keep the home screen clean.
+    lv_obj_t *features = make_pill_button(ui.scr_settings, 124, 32, C_CHAINS, "FEATURES", nullptr);
+    lv_obj_align(features, LV_ALIGN_CENTER, 0, -128);
+    lv_obj_set_user_data(features, (void *)(intptr_t)ROW_FEATURES);
+    lv_obj_add_event_cb(features, on_settings_row, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_flag(features, LV_OBJ_FLAG_HIDDEN); // Retired feature menu
+
     // Done sits in the gap at the bottom of the ring.
     ui.btn_settings_done = make_action_button(ui.scr_settings, "DONE");
     lv_obj_set_user_data(ui.btn_settings_done, (void *)(intptr_t)ROW_CLOSE);
@@ -1092,10 +1201,123 @@ void build_settings()
 }
 
 // ---------------------------------------------------------------------------
+// Optional features — drop sets only.
+// ---------------------------------------------------------------------------
+void refresh_features()
+{
+    lv_label_set_text(ui.lbl_drop_toggle, ui.drop_enabled ? "DROP SETS  ON" : "DROP SETS  OFF");
+    lv_obj_set_style_border_color(ui.btn_drop_toggle, ui.drop_enabled ? C_CHAINS : C_TRACK, 0);
+}
+
+void build_features()
+{
+    ui.scr_features = make_screen();
+    make_ring(ui.scr_features, C_TRACK);
+    lv_obj_t *title = make_label(ui.scr_features, &font_poppins_22, C_TEXT, "FEATURES");
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -119);
+
+    ui.btn_drop_toggle = make_pill_button(ui.scr_features, 226, 50, C_TRACK, "", &ui.lbl_drop_toggle);
+    lv_obj_align(ui.btn_drop_toggle, LV_ALIGN_CENTER, 0, -54);
+    lv_obj_add_event_cb(ui.btn_drop_toggle, [](lv_event_t *) {
+        ui.drop_enabled = !ui.drop_enabled;
+        { Preferences prefs; if (prefs.begin("voltra-ui", false)) { prefs.putBool("drops", ui.drop_enabled); prefs.end(); } }
+        haptics_click();
+        refresh_features();
+        refresh_main();
+    }, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *configure = make_pill_button(ui.scr_features, 226, 46, C_CHAINS, "CONFIGURE DROPS", nullptr);
+    lv_obj_align(configure, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_add_event_cb(configure, [](lv_event_t *) { haptics_click(); show(Screen::DropSets); }, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *done = make_action_button(ui.scr_features, "BACK");
+    lv_obj_add_event_cb(done, [](lv_event_t *) { haptics_click(); show(Screen::Settings); }, LV_EVENT_CLICKED, nullptr);
+    refresh_features();
+}
+
+// ---------------------------------------------------------------------------
+// Drop-set planner — OFFLINE ONLY. No load, unload, or BLE commands.
+// ---------------------------------------------------------------------------
+void refresh_drops()
+{
+    lv_label_set_text_fmt(ui.lbl_drop_pct, "%d%%", ui.drop_pct);
+    lv_label_set_text_fmt(ui.lbl_drop_count, "%d", ui.drop_count);
+    lv_obj_set_style_border_color(ui.btn_drop_pct,
+                                  ui.editing_drop_pct ? C_CHAINS : C_TRACK, 0);
+    lv_obj_set_style_border_color(ui.btn_drop_count,
+                                  ui.editing_drop_pct ? C_TRACK : C_CHAINS, 0);
+    char buf[220];
+    int n = snprintf(buf, sizeof(buf), "START   %d lb\n", ui.weight);
+    int current = ui.weight;
+    for (int i = 0; i < ui.drop_count && n > 0 && n < (int)sizeof(buf); ++i) {
+        current = (current * (100 - ui.drop_pct) + 50) / 100;
+        if (current < voltra::MIN_TARGET_LB) current = voltra::MIN_TARGET_LB;
+        n += snprintf(buf + n, sizeof(buf) - n, "DROP %d   %d lb\n", i + 1, current);
+    }
+    lv_label_set_text(ui.lbl_drop_preview, buf);
+}
+
+void on_drop_field(lv_event_t *e)
+{
+    ui.editing_drop_pct = lv_event_get_target(e) == ui.btn_drop_pct;
+    haptics_click();
+    refresh_drops();
+}
+
+void on_drop_done(lv_event_t *)
+{
+    haptics_click();
+    show(Screen::Features);
+    refresh_main();
+}
+
+void build_drops()
+{
+    ui.scr_drops = make_screen();
+    lv_obj_t *ring = make_ring(ui.scr_drops, C_CHAINS);
+    lv_arc_set_value(ring, 0);
+    lv_obj_t *title = make_label(ui.scr_drops, &font_poppins_22, C_TEXT, "DROP SET PLANNER");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_t *offline = make_label(ui.scr_drops, &font_poppins_14, C_WARN, "DEMO ONLY  /  NO RESISTANCE");
+    lv_obj_align(offline, LV_ALIGN_TOP_MID, 0, 69);
+
+    lv_obj_t *pct_title = make_label(ui.scr_drops, &font_poppins_14, C_MUTED, "DROP BY");
+    lv_obj_align(pct_title, LV_ALIGN_CENTER, -78, -70);
+    lv_obj_t *count_title = make_label(ui.scr_drops, &font_poppins_14, C_MUTED, "DROPS");
+    lv_obj_align(count_title, LV_ALIGN_CENTER, 78, -70);
+
+    ui.btn_drop_pct = make_pill_button(ui.scr_drops, 118, 56, C_CHAINS, "", nullptr);
+    lv_obj_align(ui.btn_drop_pct, LV_ALIGN_CENTER, -78, -32);
+    ui.lbl_drop_pct = make_label(ui.btn_drop_pct, &font_poppins_30, C_TEXT, "20%");
+    lv_obj_center(ui.lbl_drop_pct);
+    lv_obj_add_event_cb(ui.btn_drop_pct, on_drop_field, LV_EVENT_CLICKED, nullptr);
+
+    ui.btn_drop_count = make_pill_button(ui.scr_drops, 118, 56, C_TRACK, "", nullptr);
+    lv_obj_align(ui.btn_drop_count, LV_ALIGN_CENTER, 78, -32);
+    ui.lbl_drop_count = make_label(ui.btn_drop_count, &font_poppins_30, C_TEXT, "3");
+    lv_obj_center(ui.lbl_drop_count);
+    lv_obj_add_event_cb(ui.btn_drop_count, on_drop_field, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *hint = make_label(ui.scr_drops, &font_poppins_14, C_MUTED, "Tap a value, then rotate knob");
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 16);
+    ui.lbl_drop_preview = make_label(ui.scr_drops, &font_poppins_18, C_TEXT, "");
+    lv_obj_set_style_text_line_space(ui.lbl_drop_preview, 1, 0);
+    lv_obj_align(ui.lbl_drop_preview, LV_ALIGN_CENTER, 0, 75);
+
+    lv_obj_t *done = make_action_button(ui.scr_drops, "DONE");
+    lv_obj_add_event_cb(done, on_drop_done, LV_EVENT_CLICKED, nullptr);
+    refresh_drops();
+}
+
+// ---------------------------------------------------------------------------
 // Connect screen
 // ---------------------------------------------------------------------------
 void on_device_clicked(lv_event_t *e)
 {
+#if VOLTRA_UI_DEMO
+    (void)e;
+    return;
+#endif
     lv_obj_t *btn = lv_event_get_target(e);
     intptr_t idx = (intptr_t)lv_obj_get_user_data(btn);
     haptics_click();
@@ -1115,6 +1337,10 @@ void on_device_clicked(lv_event_t *e)
 
 void on_close_clicked(lv_event_t *)
 {
+#if VOLTRA_UI_DEMO
+    show(Screen::Main);
+    return;
+#endif
     haptics_click();
     VClient::instance().scanStop();
     show(Screen::Main);
@@ -1203,28 +1429,39 @@ void build_connect()
 // ---------------------------------------------------------------------------
 void handle_knob(int delta)
 {
-    const int step = ui.knob_rate.step(delta, millis());
+    const int weight_step = ui.knob_rate.step(delta, millis());
+    // Turbo is reserved for main weight. Keep modifier controls at 1/5.
+    const int step = weight_step > knobstep::STEP_COARSE_LB
+                   ? knobstep::STEP_COARSE_LB : weight_step;
 
     switch (ui.screen) {
         case Screen::Main: {
-            if (ui.st.conn != ConnState::Ready || ui.st.weight < voltra::MIN_TARGET_LB) break;
-            if (set_weight(apply_step(ui.weight, delta, step))) {
+            if (!VOLTRA_UI_DEMO && (ui.st.conn != ConnState::Ready || ui.st.weight < voltra::MIN_TARGET_LB)) break;
+            if (set_weight(apply_step(ui.weight, delta, weight_step))) {
                 haptics_tick();
                 refresh_main();
             }
             break;
         }
         case Screen::AdjustChains: {
-            const int cur = style_amount(ui.adj_style);
-            int v = clampi(apply_step(cur, delta, step), 0, chains_max());
+            // Main-screen Chains chip: one signed axis. Negative values select
+            // inverse chains; positive values select normal chains. Mountain
+            // retains its existing independent settings-screen behavior.
+            const bool signed_chain = ui.adj_return == Screen::Main && ui.adj_style != ChainStyle::Mountain;
+            const int cur = signed_chain && ui.style == ChainStyle::Inverse
+                          ? -ui.chains : style_amount(ui.adj_style);
+            const int max_amount = chains_max();
+            const int v = clampi(apply_step(cur, delta, step),
+                                 signed_chain ? -max_amount : 0, max_amount);
             if (v != cur) {
-                // Dialling an amount into another style switches the Voltra over to it,
-                // which turns the previous style off.
-                if (v > 0 && ui.style != ui.adj_style) {
-                    ui.style = ui.adj_style;
+                ChainStyle next_style = ui.adj_style;
+                if (signed_chain) next_style = v < 0 ? ChainStyle::Inverse : ChainStyle::Chains;
+                if (v != 0 && ui.style != next_style) {
+                    ui.style = next_style;
                     ui.style_dirty = true;
                 }
-                ui.chains = v;
+                ui.adj_style = next_style;
+                ui.chains = v < 0 ? -v : v;
                 mark_chains_changed();
                 haptics_tick();
                 refresh_adjust();
@@ -1242,6 +1479,17 @@ void handle_knob(int delta)
             }
             break;
         }
+        case Screen::DropSets: {
+            if (ui.editing_drop_pct) {
+                int next = clampi(ui.drop_pct + (delta > 0 ? 5 : -5), 5, 50);
+                if (next != ui.drop_pct) { ui.drop_pct = next; haptics_tick(); refresh_drops(); }
+            } else {
+                int next = clampi(ui.drop_count + (delta > 0 ? 1 : -1), 1, 5);
+                if (next != ui.drop_count) { ui.drop_count = next; haptics_tick(); refresh_drops(); }
+            }
+            break;
+        }
+        case Screen::Features:
         case Screen::Settings:
             break;   // all four bubbles are visible at once; selection is by touch
         case Screen::Connect:
@@ -1260,8 +1508,8 @@ void poll_cb(lv_timer_t *)
 
     flush_pending(now);
 
-    bool state_changed = c.version() != ui.last_state_version;
-    bool devs_changed = c.devicesVersion() != ui.last_dev_version;
+    bool state_changed = !VOLTRA_UI_DEMO && c.version() != ui.last_state_version;
+    bool devs_changed = !VOLTRA_UI_DEMO && c.devicesVersion() != ui.last_dev_version;
 
     if (state_changed) {
         ui.last_state_version = c.version();
@@ -1325,12 +1573,16 @@ void poll_cb(lv_timer_t *)
         case Screen::Main:
             if (state_changed || pending_expired) refresh_main();
             break;
+        case Screen::Features:
+            break;
         case Screen::Settings:
             if (state_changed) refresh_settings();
             break;
         case Screen::AdjustChains:
         case Screen::AdjustEcc:
             if (state_changed) refresh_adjust();
+            break;
+        case Screen::DropSets:
             break;
         case Screen::Connect:
             if (state_changed || devs_changed) {
@@ -1359,10 +1611,13 @@ void poll_cb(lv_timer_t *)
 
 void ui_init()
 {
+    { Preferences prefs; if (prefs.begin("voltra-ui", true)) { ui.drop_enabled = false; prefs.end(); } }
     build_main();
     build_settings();
+    build_features();
     build_adjust();
     build_connect();
+    build_drops();
     lv_scr_load(ui.scr_main);
     ui.st = VClient::instance().state();
     refresh_main();

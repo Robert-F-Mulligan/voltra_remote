@@ -4,8 +4,8 @@
  * knob is being turned.
  *
  * A deliberate, slow turn moves 1 lb per detent so you can dial an exact weight.
- * Spinning the knob switches to 5 lb per detent, so crossing the full 5-200 lb
- * range stays a short travel.
+ * Spinning the main weight dial switches to 5 lb per detent, or 10 lb
+ * per detent for very fast turns. Other adjustments remain at 1/5.
  *
  * Header-only and free of Arduino/LVGL dependencies so it can be unit-tested on
  * the host.
@@ -16,10 +16,13 @@ namespace knobstep {
 
 constexpr int STEP_FINE_LB = 1;
 constexpr int STEP_COARSE_LB = 5;
+constexpr int STEP_TURBO_LB = 10;
 
 /** Per-detent interval thresholds, with a dead band so the mode cannot flap mid-turn. */
 constexpr uint32_t COARSE_ENTER_MS = 70;   // faster than this -> coarse
 constexpr uint32_t COARSE_EXIT_MS = 140;   // slower than this -> fine
+constexpr uint32_t TURBO_ENTER_MS = 35;   // very fast rotation -> turbo
+constexpr uint32_t TURBO_EXIT_MS = 60;    // hysteresis when slowing down
 constexpr uint32_t IDLE_RESET_MS = 400;    // a pause this long resets to fine
 
 /** Division rounding towards negative / positive infinity (C truncates towards zero). */
@@ -67,27 +70,34 @@ public:
             // First movement after a pause is always fine, so a single deliberate
             // click is 1 lb no matter how fast the previous turn was.
             coarse_ = false;
+            turbo_ = false;
         } else if (n > 0) {
             const uint32_t per_detent = elapsed / (uint32_t)n;
             if (per_detent <= COARSE_ENTER_MS) coarse_ = true;
             else if (per_detent >= COARSE_EXIT_MS) coarse_ = false;
+            if (per_detent <= TURBO_ENTER_MS) turbo_ = true;
+            else if (per_detent >= TURBO_EXIT_MS) turbo_ = false;
+            if (!coarse_) turbo_ = false;
         }
         last_ms_ = now_ms;
         started_ = true;
-        return coarse_ ? STEP_COARSE_LB : STEP_FINE_LB;
+        return turbo_ ? STEP_TURBO_LB : (coarse_ ? STEP_COARSE_LB : STEP_FINE_LB);
     }
 
     bool coarse() const { return coarse_; }
+    bool turbo() const { return turbo_; }
 
     void reset()
     {
         coarse_ = false;
+        turbo_ = false;
         started_ = false;
         last_ms_ = 0;
     }
 
 private:
     bool coarse_ = false;
+    bool turbo_ = false;
     bool started_ = false;
     uint32_t last_ms_ = 0;
 };
