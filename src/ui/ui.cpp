@@ -65,8 +65,10 @@ constexpr uint32_t EDIT_HOLD_MS = 900;
 // flicking back to unloaded mid-sequence.
 constexpr uint32_t TOGGLE_PENDING_MS = 5000;
 constexpr uint32_t AUTO_LOAD_PENDING_MS = 4000;
+// Bridge brief telemetry gaps without keeping stale countdown/force values visible.
+constexpr uint32_t AUTO_LOAD_RECOVERY_MS = 6000;
 
-enum class AutoView { Hidden, Starting, Waiting, Countdown, Engaging };
+enum class AutoView { Hidden, Starting, Waiting, Countdown, Engaging, Syncing };
 
 enum class Screen { Main, Settings, AdjustChains, AdjustEcc, Connect, DropSets, Features };
 
@@ -118,6 +120,7 @@ struct Ui {
     int auto_target_lb = -1;
     AutoView auto_view = AutoView::Hidden;
     int auto_seconds = -1;
+    int auto_force_lb = -2;
     bool auto_dismissed = false;
     bool compact_set = false;
     bool counters_raised = false;
@@ -665,10 +668,16 @@ void refresh_auto_view(uint32_t now)
     const bool tap_loading = now < ui.toggle_pending_until && ui.toggle_target_loaded;
     AutoView view = AutoView::Hidden;
     if (!VOLTRA_UI_DEMO && st.conn == ConnState::Ready && !tap_loading && !ui.auto_dismissed) {
-        if (fresh && voltra::fitness_mode_is_auto_load(st.fitness_mode)) {
-            if (st.direct_load_status == voltra::DIRECT_LOAD_ST_WAITING) view = AutoView::Waiting;
-            else if (st.direct_load_status == voltra::DIRECT_LOAD_ST_COUNTDOWN) view = AutoView::Countdown;
-            else if (st.direct_load_status == voltra::DIRECT_LOAD_ST_ENGAGING) view = AutoView::Engaging;
+        if (voltra::fitness_mode_is_auto_load(st.fitness_mode) &&
+            st.direct_load_status != voltra::DIRECT_LOAD_ST_LOADED) {
+            if (fresh) {
+                if (st.direct_load_status == voltra::DIRECT_LOAD_ST_WAITING) view = AutoView::Waiting;
+                else if (st.direct_load_status == voltra::DIRECT_LOAD_ST_COUNTDOWN) view = AutoView::Countdown;
+                else if (st.direct_load_status == voltra::DIRECT_LOAD_ST_ENGAGING) view = AutoView::Engaging;
+                else view = AutoView::Syncing; // Mode can arrive before progress, including device-initiated auto load.
+            } else if (now - st.last_rx_ms < AUTO_LOAD_RECOVERY_MS) {
+                view = AutoView::Syncing; // Keep the modal surface, but never an expired number.
+            }
         }
         if (view == AutoView::Hidden && !st.loaded() && now < ui.auto_load_pending_until)
             view = AutoView::Starting;
@@ -676,17 +685,22 @@ void refresh_auto_view(uint32_t now)
     if (view != ui.auto_view) {
         ui.auto_view = view;
         ui.auto_seconds = -1;
+        ui.auto_force_lb = -2;
         lv_anim_del(ui.auto_ring, auto_ring_opa);
         auto_ring_opa(ui.auto_ring, LV_OPA_COVER);
         set_obj_hidden(ui.countdown_overlay, view == AutoView::Hidden);
         if (view == AutoView::Hidden) return;
         lv_obj_move_foreground(ui.countdown_overlay);
-        lv_label_set_text(ui.countdown_caption, "AUTO LOAD");
-        lv_label_set_text(ui.auto_cancel_label, view == AutoView::Engaging ? "UNLOAD" : "CANCEL");
+        lv_obj_set_style_text_font(ui.countdown_caption,
+            view == AutoView::Engaging ? &font_poppins_22 : &font_poppins_30, 0);
+        lv_label_set_text(ui.countdown_caption, view == AutoView::Engaging ? "CURRENT (lb)" : "AUTO LOAD");
+        lv_label_set_text(ui.auto_cancel_label, (view == AutoView::Engaging || (view == AutoView::Syncing && st.loaded())) ? "UNLOAD" : "CANCEL");
         lv_obj_set_style_text_font(ui.countdown_number,
-            view == AutoView::Countdown ? &font_poppins_96 : &font_poppins_30, 0);
+            (view == AutoView::Countdown || view == AutoView::Engaging) ? &font_poppins_96 :
+            view == AutoView::Syncing ? &font_poppins_22 : &font_poppins_30, 0);
         lv_label_set_text(ui.countdown_number, view == AutoView::Starting ? "STARTING..." :
-            view == AutoView::Waiting ? "PULL & HOLD" : view == AutoView::Engaging ? "LOADING" : "");
+            view == AutoView::Waiting ? "PULL & HOLD" : view == AutoView::Engaging ? "--" :
+            view == AutoView::Syncing ? "WAITING FOR DEVICE" : "");
         if (view == AutoView::Starting || view == AutoView::Waiting) {
             lv_anim_t a;
             lv_anim_init(&a);
@@ -701,7 +715,18 @@ void refresh_auto_view(uint32_t now)
     }
     if (view != AutoView::Hidden && ui.auto_target_lb != ui.weight) {
         ui.auto_target_lb = ui.weight;
-        lv_label_set_text_fmt(ui.auto_target, "%d lb", ui.weight);
+        lv_label_set_text_fmt(ui.auto_target, "TARGET %d lb", ui.weight);
+    }
+    if (view == AutoView::Engaging) {
+        // Use the same measured resistance stream as the workout weight display,
+        // independent of rep phase or modifier settings while resistance ramps up.
+        // Never substitute the configured target or interpolate a fictional ramp.
+        const int force_lb = st.live_force_tenths >= 0 ? (st.live_force_tenths + 5) / 10 : -1;
+        if (force_lb != ui.auto_force_lb) {
+            ui.auto_force_lb = force_lb;
+            if (force_lb >= 0) lv_label_set_text_fmt(ui.countdown_number, "%d", force_lb);
+            else lv_label_set_text(ui.countdown_number, "--");
+        }
     }
     if (view == AutoView::Countdown) {
         const int ms = st.direct_load_countdown_ms;
@@ -1644,6 +1669,10 @@ void poll_cb(lv_timer_t *)
 
     bool state_changed = !VOLTRA_UI_DEMO && c.version() != ui.last_state_version;
     bool devs_changed = !VOLTRA_UI_DEMO && c.devicesVersion() != ui.last_dev_version;
+
+    // last_rx_ms updates for every received packet, but unchanged values do not
+    // bump the client version. Refresh freshness even when the UI values are unchanged.
+    if (!VOLTRA_UI_DEMO && !state_changed) ui.st.last_rx_ms = c.state().last_rx_ms;
 
     if (state_changed) {
         ui.last_state_version = c.version();
