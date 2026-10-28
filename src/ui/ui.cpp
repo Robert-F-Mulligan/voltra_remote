@@ -35,8 +35,8 @@ namespace {
 #define C_MUTED    lv_color_hex(0x94a3b8)
 #define C_UNLOADED lv_color_hex(0x3b82f6)
 #define C_LOADED   lv_color_hex(0xc6fe28)
-// Unloaded, as on the Voltra: the weight in a muted green and the ring in grey.
-#define C_IDLE_NUM  lv_color_hex(0x29320d)
+// Keep the configured weight legible before loading; state is also shown in text.
+#define C_IDLE_NUM  C_TEXT
 #define C_IDLE_RING lv_color_hex(0x6b7280)
 #define C_CHAINS   lv_color_hex(0x4ed8d0)
 #define C_ECC      lv_color_hex(0xffae72)
@@ -65,6 +65,10 @@ constexpr uint32_t EDIT_HOLD_MS = 900;
 // flicking back to unloaded mid-sequence.
 constexpr uint32_t TOGGLE_PENDING_MS = 5000;
 constexpr uint32_t AUTO_LOAD_PENDING_MS = 4000;
+// Bridge brief telemetry gaps without keeping stale countdown/force values visible.
+constexpr uint32_t AUTO_LOAD_RECOVERY_MS = 6000;
+
+enum class AutoView { Hidden, Starting, Waiting, Countdown, Engaging, Syncing };
 
 enum class Screen { Main, Settings, AdjustChains, AdjustEcc, Connect, DropSets, Features };
 
@@ -108,6 +112,19 @@ struct Ui {
     lv_obj_t *countdown_overlay = nullptr;
     lv_obj_t *countdown_number = nullptr;
     lv_obj_t *countdown_caption = nullptr;
+    lv_obj_t *auto_ring = nullptr;
+    lv_obj_t *auto_cancel = nullptr;
+    lv_obj_t *auto_cancel_label = nullptr;
+    lv_obj_t *auto_target = nullptr;
+    lv_obj_t *set_connection = nullptr;
+    int auto_target_lb = -1;
+    AutoView auto_view = AutoView::Hidden;
+    int auto_seconds = -1;
+    int auto_force_lb = -2;
+    bool auto_dismissed = false;
+    bool compact_set = false;
+    bool counters_raised = false;
+    bool editing_shown = false;
     lv_obj_t *btn_gear = nullptr;
     lv_obj_t *lbl_gear = nullptr;
     // active accessories either side of the settings button: eccentric left, chain style right
@@ -602,6 +619,141 @@ void make_preset(int i, int x, int y)
     lv_obj_align(pr.unit, LV_ALIGN_CENTER, 0, 13);
 }
 
+// Presentation only: never changes workout state or rep counting.
+void refresh_set_layout()
+{
+    const bool in_set = ui.st.conn == ConnState::Ready && ui.st.loaded() && ui.set_active;
+    const bool raised = in_set; // Keep the same layout through pauses within a set.
+    if (in_set != ui.compact_set) {
+        ui.compact_set = in_set;
+        lv_obj_set_style_text_font(ui.lbl_weight, in_set ? &font_poppins_bold_64 : &font_poppins_96, 0);
+        lv_obj_set_style_pad_bottom(ui.lbl_unit,
+            (in_set ? font_poppins_bold_64.base_line : font_poppins_96.base_line) - 1, 0);
+        lv_obj_set_size(ui.btn_center, 236, in_set ? 104 : 150);
+        lv_obj_align(ui.btn_center, LV_ALIGN_CENTER, 0, in_set ? -80 : -34);
+        Ui::Chip *chips[] = {&ui.chip_chain, &ui.chip_ecc};
+        for (int i = 0; i < 2; ++i) {
+            auto &chip = *chips[i];
+            lv_obj_set_size(chip.btn, in_set ? 94 : 70, in_set ? 44 : 70);
+            lv_obj_align(chip.btn, LV_ALIGN_CENTER, (i ? 1 : -1) * (in_set ? 54 : 74), in_set ? 120 : 96);
+            lv_obj_align(chip.icon, LV_ALIGN_CENTER, in_set ? -33 : 0, in_set ? 0 : -17);
+            lv_obj_align(chip.primary, LV_ALIGN_CENTER, in_set ? 10 : 0, in_set ? 0 : 1);
+            lv_obj_set_style_text_font(chip.primary, in_set ? &font_poppins_16 : &font_poppins_14, 0);
+            set_obj_hidden(chip.secondary, in_set);
+            lv_obj_set_ext_click_area(chip.btn, in_set ? 4 : 0);
+        }
+        set_obj_hidden(ui.lbl_kbat, in_set);
+        set_obj_hidden(ui.btn_top, in_set);
+        set_obj_hidden(ui.set_connection, !in_set);
+    }
+    if (raised != ui.counters_raised) {
+        ui.counters_raised = raised;
+        lv_obj_align(ui.lbl_set_cap, LV_ALIGN_CENTER, -64, raised ? 2 : 38);
+        lv_obj_align(ui.lbl_rep_cap, LV_ALIGN_CENTER, 64, raised ? 2 : 38);
+        lv_obj_align(ui.lbl_set_num, LV_ALIGN_CENTER, -64, raised ? 50 : 86);
+        lv_obj_align(ui.lbl_rep_num, LV_ALIGN_CENTER, 64, raised ? 50 : 86);
+        lv_obj_align(ui.rep_dots, LV_ALIGN_CENTER, 64, raised ? 64 : 100);
+    }
+}
+
+void auto_ring_opa(void *obj, int32_t opacity)
+{
+    lv_obj_set_style_arc_opa(static_cast<lv_obj_t *>(obj), opacity, LV_PART_INDICATOR);
+}
+
+void refresh_auto_view(uint32_t now)
+{
+    const auto &st = ui.st;
+    const bool fresh = now - st.last_rx_ms < 1200;
+    const bool tap_loading = now < ui.toggle_pending_until && ui.toggle_target_loaded;
+    AutoView view = AutoView::Hidden;
+    if (!VOLTRA_UI_DEMO && st.conn == ConnState::Ready && !tap_loading && !ui.auto_dismissed) {
+        if (voltra::fitness_mode_is_auto_load(st.fitness_mode) &&
+            st.direct_load_status != voltra::DIRECT_LOAD_ST_LOADED) {
+            if (fresh) {
+                if (st.direct_load_status == voltra::DIRECT_LOAD_ST_WAITING) view = AutoView::Waiting;
+                else if (st.direct_load_status == voltra::DIRECT_LOAD_ST_COUNTDOWN) view = AutoView::Countdown;
+                else if (st.direct_load_status == voltra::DIRECT_LOAD_ST_ENGAGING) view = AutoView::Engaging;
+                else view = AutoView::Syncing; // Mode can arrive before progress, including device-initiated auto load.
+            } else if (now - st.last_rx_ms < AUTO_LOAD_RECOVERY_MS) {
+                view = AutoView::Syncing; // Keep the modal surface, but never an expired number.
+            }
+        }
+        if (view == AutoView::Hidden && !st.loaded() && now < ui.auto_load_pending_until)
+            view = AutoView::Starting;
+    }
+    if (view != ui.auto_view) {
+        ui.auto_view = view;
+        ui.auto_seconds = -1;
+        ui.auto_force_lb = -2;
+        lv_anim_del(ui.auto_ring, auto_ring_opa);
+        auto_ring_opa(ui.auto_ring, LV_OPA_COVER);
+        set_obj_hidden(ui.countdown_overlay, view == AutoView::Hidden);
+        if (view == AutoView::Hidden) return;
+        lv_obj_move_foreground(ui.countdown_overlay);
+        lv_obj_set_style_text_font(ui.countdown_caption,
+            view == AutoView::Engaging ? &font_poppins_22 : &font_poppins_30, 0);
+        lv_label_set_text(ui.countdown_caption, view == AutoView::Engaging ? "CURRENT (lb)" : "AUTO LOAD");
+        lv_label_set_text(ui.auto_cancel_label, (view == AutoView::Engaging || (view == AutoView::Syncing && st.loaded())) ? "UNLOAD" : "CANCEL");
+        lv_obj_set_style_text_font(ui.countdown_number,
+            (view == AutoView::Countdown || view == AutoView::Engaging) ? &font_poppins_96 :
+            view == AutoView::Syncing ? &font_poppins_22 : &font_poppins_30, 0);
+        lv_label_set_text(ui.countdown_number, view == AutoView::Starting ? "STARTING..." :
+            view == AutoView::Waiting ? "PULL & HOLD" : view == AutoView::Engaging ? "--" :
+            view == AutoView::Syncing ? "WAITING FOR DEVICE" : "");
+        if (view == AutoView::Starting || view == AutoView::Waiting) {
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, ui.auto_ring);
+            lv_anim_set_exec_cb(&a, auto_ring_opa);
+            lv_anim_set_values(&a, LV_OPA_40, LV_OPA_COVER);
+            lv_anim_set_time(&a, 850);
+            lv_anim_set_playback_time(&a, 850);
+            lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_start(&a);
+        }
+    }
+    if (view != AutoView::Hidden && ui.auto_target_lb != ui.weight) {
+        ui.auto_target_lb = ui.weight;
+        lv_label_set_text_fmt(ui.auto_target, "TARGET %d lb", ui.weight);
+    }
+    if (view == AutoView::Engaging) {
+        // Use the same measured resistance stream as the workout weight display,
+        // independent of rep phase or modifier settings while resistance ramps up.
+        // Never substitute the configured target or interpolate a fictional ramp.
+        const int force_lb = st.live_force_tenths >= 0 ? (st.live_force_tenths + 5) / 10 : -1;
+        if (force_lb != ui.auto_force_lb) {
+            ui.auto_force_lb = force_lb;
+            if (force_lb >= 0) lv_label_set_text_fmt(ui.countdown_number, "%d", force_lb);
+            else lv_label_set_text(ui.countdown_number, "--");
+        }
+    }
+    if (view == AutoView::Countdown) {
+        const int ms = st.direct_load_countdown_ms;
+        const int seconds = ms > 0 && ms <= 3000 ? (ms + 999) / 1000 : 0;
+        if (seconds != ui.auto_seconds) {
+            ui.auto_seconds = seconds;
+            lv_obj_set_style_text_font(ui.countdown_number,
+                seconds ? &font_poppins_96 : &font_poppins_30, 0);
+            if (seconds) lv_label_set_text_fmt(ui.countdown_number, "%d", seconds);
+            else lv_label_set_text(ui.countdown_number, "HOLD STEADY");
+            lv_label_set_text(ui.countdown_caption, seconds ? "HOLD STEADY" : "AUTO LOAD");
+        }
+    }
+}
+
+void on_auto_cancel(lv_event_t *)
+{
+    // An explicit cancel/unload only; never toggle into a load if telemetry races the tap.
+    ui.auto_dismissed = true;
+    ui.auto_load_pending_until = 0;
+    ui.toggle_target_loaded = false;
+    ui.toggle_pending_until = millis() + TOGGLE_PENDING_MS;
+    VClient::instance().unload();
+    haptics_click();
+    refresh_main();
+}
+
 void refresh_main()
 {
     const DeviceState &st = ui.st;
@@ -628,7 +780,8 @@ void refresh_main()
     // A tap-to-load runs briefly through the auto-load states; show it as loading rather
     // than asking for a pull.
     const bool tap_loading = now < ui.toggle_pending_until && ui.toggle_target_loaded;
-    const bool auto_loading = connected && !tap_loading &&
+    const bool auto_loading = connected && !tap_loading && !ui.auto_dismissed &&
+                              (now - st.last_rx_ms < 1200 || now < ui.auto_load_pending_until) &&
                               (st.auto_loading() || now < ui.auto_load_pending_until);
     if (VOLTRA_UI_DEMO) {
         lv_label_set_text(ui.lbl_state, "PREVIEW ONLY  |  LOAD DISABLED");
@@ -636,6 +789,10 @@ void refresh_main()
         lv_obj_set_style_text_color(ui.lbl_weight, C_TEXT, 0);
     } else if (!weight_known) {
         lv_label_set_text(ui.lbl_state, "");   // the big link message says it all
+    } else if (st.auto_loading() && now - st.last_rx_ms >= 1200 && !ui.auto_load_pending_until) {
+        lv_label_set_text(ui.lbl_state, "WAITING FOR DEVICE");
+        lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
     } else if (auto_loading && !loaded) {
         // The Voltra's auto load: waiting for the cable to be pulled out and held, then
         // a 3 s countdown before it loads.
@@ -662,24 +819,8 @@ void refresh_main()
         lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
     }
 
-    // Full-dial auto-load countdown: display only the device-reported time.
-    // No synthetic countdown: stale/missing telemetry must never imply loading is imminent.
-    const int load_ms = st.direct_load_countdown_ms;
-    const bool count_visible = !VOLTRA_UI_DEMO && ready && !loaded &&
-                               auto_loading && st.auto_loading() &&
-                               st.direct_load_status == voltra::DIRECT_LOAD_ST_COUNTDOWN &&
-                               load_ms > 0 && load_ms <= 3000 &&
-                               (now - st.last_rx_ms < 1200);
-    set_obj_hidden(ui.countdown_overlay, !count_visible);
-    if (count_visible) {
-        const int seconds = (load_ms + 999) / 1000;
-        lv_label_set_text_fmt(ui.countdown_number, "%d", seconds);
-        lv_label_set_text(ui.countdown_caption, "AUTO LOAD");
-        const bool pulse = (now / 250) % 2 == 0;
-        lv_obj_set_style_bg_color(ui.countdown_overlay,
-                                  pulse ? C_WARN : lv_color_hex(0x9a3412), 0);
-        lv_obj_move_foreground(ui.countdown_overlay);
-    }
+    refresh_auto_view(now);
+    refresh_set_layout();
 
     // top bar: Bluetooth icon (blue when connected, white when not) and, once connected,
     // the Voltra's battery level. Recolour markup colours just the icon.
@@ -726,9 +867,12 @@ void refresh_main()
     const bool moving = st.rep_phase >= 1 && st.rep_phase <= 3;
     if (set_mode && accessory_on && moving && st.live_force_tenths >= 0 && now >= ui.editing_until) {
         lv_label_set_text_fmt(ui.lbl_weight, "%d", (st.live_force_tenths + 5) / 10);
-        lv_label_set_text_fmt(ui.lbl_state, "Live  (base %d lb)", ui.weight);
+        lv_label_set_text(ui.lbl_state, "");
         lv_obj_set_style_text_color(ui.lbl_state, C_TEXT, 0);
     }
+
+    ui.editing_shown = weight_known && now < ui.editing_until && !pending && !auto_loading;
+    if (ui.editing_shown) lv_label_set_text(ui.lbl_state, "SET WEIGHT");
 
     // reps / live force (small line, outside a set)
     if (set_mode) {
@@ -837,6 +981,7 @@ void on_center_hold(lv_event_t *)
     }
     flush_pending(millis() + SEND_DEBOUNCE_MS);
     ui.toggle_pending_until = 0;
+    ui.auto_dismissed = false;
     ui.auto_load_pending_until = millis() + AUTO_LOAD_PENDING_MS;
     VClient::instance().autoLoad();
     haptics_double();
@@ -901,6 +1046,10 @@ void build_main()
     lv_label_set_text(ui.lbl_top, "#" C_WHITE_HEX " " LV_SYMBOL_BLUETOOTH "#");
     lv_obj_center(ui.lbl_top);
 
+    ui.set_connection = make_label(ui.scr_main, &font_poppins_16, C_UNLOADED, LV_SYMBOL_BLUETOOTH);
+    lv_obj_align(ui.set_connection, LV_ALIGN_CENTER, 0, -145);
+    lv_obj_add_flag(ui.set_connection, LV_OBJ_FLAG_HIDDEN);
+
     // sets / reps sit under the weight
     ui.lbl_reps = make_label(ui.scr_main, &font_poppins_14, C_MUTED, "");
     lv_obj_align(ui.lbl_reps, LV_ALIGN_CENTER, 0, 50);
@@ -964,20 +1113,29 @@ void build_main()
     ui.lbl_gear = make_label(ui.btn_gear, &font_icons_26, C_TEXT, ICON_SETTINGS);
     lv_obj_center(ui.lbl_gear);
 
-    // High-contrast full-dial countdown. Non-clickable so the original
-    // centre load/unload gesture remains the only load control.
+    // Modal auto-load surface consumes touches over every hidden control.
     ui.countdown_overlay = lv_obj_create(ui.scr_main);
     lv_obj_remove_style_all(ui.countdown_overlay);
     lv_obj_set_size(ui.countdown_overlay, 360, 360);
-    lv_obj_align(ui.countdown_overlay, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_center(ui.countdown_overlay);
     lv_obj_set_style_radius(ui.countdown_overlay, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(ui.countdown_overlay, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(ui.countdown_overlay, C_WARN, 0);
-    lv_obj_clear_flag(ui.countdown_overlay, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    ui.countdown_number = make_label(ui.countdown_overlay, &font_poppins_96, C_TEXT, "3");
-    lv_obj_align(ui.countdown_number, LV_ALIGN_CENTER, 0, -12);
-    ui.countdown_caption = make_label(ui.countdown_overlay, &font_poppins_22, C_TEXT, "AUTO LOAD");
-    lv_obj_align(ui.countdown_caption, LV_ALIGN_CENTER, 0, 84);
+    lv_obj_set_style_bg_color(ui.countdown_overlay, C_BG, 0);
+    lv_obj_add_flag(ui.countdown_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(ui.countdown_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    ui.auto_ring = make_ring(ui.countdown_overlay, C_WARN);
+    lv_arc_set_bg_angles(ui.auto_ring, 0, 360);
+    lv_arc_set_value(ui.auto_ring, 100);
+    ui.countdown_number = make_label(ui.countdown_overlay, &font_poppins_30, C_TEXT, "");
+    lv_obj_align(ui.countdown_number, LV_ALIGN_CENTER, 0, -10);
+    ui.countdown_caption = make_label(ui.countdown_overlay, &font_poppins_30, C_WARN, "AUTO LOAD");
+    lv_obj_align(ui.countdown_caption, LV_ALIGN_CENTER, 0, -83);
+    ui.auto_target = make_label(ui.countdown_overlay, &font_poppins_22, C_TEXT, "");
+    lv_obj_align(ui.auto_target, LV_ALIGN_CENTER, 0, 62);
+    ui.auto_cancel = make_pill_button(ui.countdown_overlay, 148, 48, C_WARN, "CANCEL", &ui.auto_cancel_label);
+    lv_obj_set_style_text_font(ui.auto_cancel_label, &font_poppins_22, 0);
+    lv_obj_align(ui.auto_cancel, LV_ALIGN_CENTER, 0, 103);
+    lv_obj_add_event_cb(ui.auto_cancel, on_auto_cancel, LV_EVENT_SHORT_CLICKED, nullptr);
     lv_obj_add_flag(ui.countdown_overlay, LV_OBJ_FLAG_HIDDEN);
 
     // Chips for the active accessories, shown only while on. Kept inside the ring: the
@@ -1436,6 +1594,7 @@ void handle_knob(int delta)
 
     switch (ui.screen) {
         case Screen::Main: {
+            if (ui.auto_view != AutoView::Hidden) break; // Do not change an obscured target weight.
             if (!VOLTRA_UI_DEMO && (ui.st.conn != ConnState::Ready || ui.st.weight < voltra::MIN_TARGET_LB)) break;
             if (set_weight(apply_step(ui.weight, delta, weight_step))) {
                 haptics_tick();
@@ -1511,9 +1670,14 @@ void poll_cb(lv_timer_t *)
     bool state_changed = !VOLTRA_UI_DEMO && c.version() != ui.last_state_version;
     bool devs_changed = !VOLTRA_UI_DEMO && c.devicesVersion() != ui.last_dev_version;
 
+    // last_rx_ms updates for every received packet, but unchanged values do not
+    // bump the client version. Refresh freshness even when the UI values are unchanged.
+    if (!VOLTRA_UI_DEMO && !state_changed) ui.st.last_rx_ms = c.state().last_rx_ms;
+
     if (state_changed) {
         ui.last_state_version = c.version();
         ui.st = c.state();
+        if (!voltra::fitness_mode_is_auto_load(ui.st.fitness_mode)) ui.auto_dismissed = false;
         if (ui.st.accessory_display != ui.last_display) {
             ui.last_display = ui.st.accessory_display;
             ui.c_dirty = ui.e_dirty = ui.style_dirty = false;
@@ -1571,7 +1735,15 @@ void poll_cb(lv_timer_t *)
 
     switch (ui.screen) {
         case Screen::Main:
-            if (state_changed || pending_expired) refresh_main();
+            if (!ui.st.connected()) { ui.auto_load_pending_until = 0; ui.auto_dismissed = false; }
+            if (state_changed || pending_expired || (ui.editing_shown && now >= ui.editing_until)) refresh_main();
+            // Deadlines and animation cleanup must run even when BLE telemetry stops.
+            refresh_set_layout();
+            {
+                const AutoView previous_view = ui.auto_view;
+                refresh_auto_view(now);
+                if (previous_view != AutoView::Hidden && ui.auto_view == AutoView::Hidden) refresh_main();
+            }
             break;
         case Screen::Features:
             break;
