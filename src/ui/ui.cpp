@@ -171,6 +171,10 @@ struct Ui {
     lv_obj_t *lbl_adj_unit = nullptr;
     lv_obj_t *lbl_adj_range = nullptr;
     lv_obj_t *btn_done = nullptr;
+    lv_obj_t *btn_adj_reset = nullptr;
+    lv_obj_t *btn_mountain = nullptr;
+    lv_obj_t *lbl_mountain = nullptr;
+    ChainStyle before_mountain = ChainStyle::Chains;
 
     // Offline drop-set planner: configuration and preview only, no BLE actions.
     lv_obj_t *scr_drops = nullptr;
@@ -1167,10 +1171,29 @@ void build_main()
 // ---------------------------------------------------------------------------
 // Adjust screen (chains / eccentric)
 // ---------------------------------------------------------------------------
+bool can_switch_mountain()
+{
+    return VOLTRA_UI_DEMO || (ui.st.conn == ConnState::Ready && !ui.st.loaded() &&
+           !ui.st.auto_loading() && !ui.auto_load_pending_until && !ui.toggle_pending_until);
+}
+
 void refresh_adjust()
 {
     bool chains = ui.screen == Screen::AdjustChains;
     lv_label_set_text(ui.lbl_adj_unit, accessory_unit());
+    if (chains) {
+        lv_obj_clear_flag(ui.btn_mountain, LV_OBJ_FLAG_HIDDEN);
+        const bool mountain = ui.adj_style == ChainStyle::Mountain;
+        const bool available = can_switch_mountain();
+        lv_label_set_text(ui.lbl_mountain, !available ? (ui.st.conn != ConnState::Ready ? "CONNECT TO SWITCH" : "UNLOAD TO SWITCH") :
+                          mountain ? "MOUNTAIN  ON" : "MOUNTAIN  OFF");
+        lv_obj_set_style_border_color(ui.btn_mountain, mountain ? C_WARN : C_TRACK, 0);
+        lv_obj_set_style_text_color(ui.lbl_mountain, mountain ? C_WARN : C_TEXT, 0);
+        if (available) lv_obj_clear_state(ui.btn_mountain, LV_STATE_DISABLED);
+        else lv_obj_add_state(ui.btn_mountain, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_flag(ui.btn_mountain, LV_OBJ_FLAG_HIDDEN);
+    }
     if (chains) {
         int mx = chains_max();
         const bool signed_chain = ui.adj_return == Screen::Main && ui.adj_style != ChainStyle::Mountain;
@@ -1221,6 +1244,36 @@ void on_adjust_done(lv_event_t *)
     else refresh_settings();
 }
 
+void on_adjust_reset(lv_event_t *)
+{
+    if (ui.screen == Screen::AdjustChains) {
+        ui.chains = 0;
+        mark_chains_changed();
+    } else if (ui.screen == Screen::AdjustEcc) {
+        ui.ecc = 0;
+        mark_ecc_changed();
+    } else return;
+    haptics_click();
+    refresh_adjust();
+}
+
+void on_mountain_toggle(lv_event_t *)
+{
+    if (ui.screen != Screen::AdjustChains || !can_switch_mountain()) return;
+    if (ui.adj_style == ChainStyle::Mountain) {
+        ui.adj_style = ui.before_mountain;
+    } else {
+        ui.before_mountain = ui.adj_style;
+        ui.adj_style = ChainStyle::Mountain;
+    }
+    ui.style = ui.adj_style;
+    ui.style_dirty = true;
+    // All three curves share one nonnegative amount. Preserve its magnitude.
+    mark_chains_changed();
+    haptics_click();
+    refresh_adjust();
+}
+
 void on_gear_clicked(lv_event_t *)
 {
     haptics_click();
@@ -1237,15 +1290,30 @@ void build_adjust()
     lv_obj_align(ui.lbl_adj_title, LV_ALIGN_TOP_MID, 0, 40);
 
     ui.btn_adj_center = make_flat_button(ui.scr_adjust, 230, 130);
-    lv_obj_align(ui.btn_adj_center, LV_ALIGN_CENTER, 0, -26);
+    lv_obj_align(ui.btn_adj_center, LV_ALIGN_CENTER, 0, -38);
     lv_obj_add_event_cb(ui.btn_adj_center, on_adjust_done, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *row = make_value_row(ui.btn_adj_center, &font_poppins_96, &ui.lbl_adj_val, &ui.lbl_adj_unit);
     lv_obj_center(row);
 
     ui.lbl_adj_range = make_label(ui.scr_adjust, &font_poppins_14, C_MUTED, "");
-    lv_obj_align(ui.lbl_adj_range, LV_ALIGN_CENTER, 0, 50);
+    lv_obj_align(ui.lbl_adj_range, LV_ALIGN_CENTER, 0, 30);
 
-    ui.btn_done = make_action_button(ui.scr_adjust, "DONE");
+    ui.btn_mountain = make_pill_button(ui.scr_adjust, 208, 44, C_TRACK,
+                                       "MOUNTAIN  OFF", &ui.lbl_mountain);
+    lv_obj_set_style_text_font(ui.lbl_mountain, &font_poppins_16, 0);
+    lv_obj_align(ui.btn_mountain, LV_ALIGN_CENTER, 0, 73);
+    lv_obj_add_event_cb(ui.btn_mountain, on_mountain_toggle, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *reset_label = nullptr;
+    ui.btn_adj_reset = make_pill_button(ui.scr_adjust, 100, 44, C_TRACK, "RESET", &reset_label);
+    lv_obj_set_style_text_font(reset_label, &font_poppins_22, 0);
+    lv_obj_align(ui.btn_adj_reset, LV_ALIGN_CENTER, -56, 123);
+    lv_obj_add_event_cb(ui.btn_adj_reset, on_adjust_reset, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *done_label = nullptr;
+    ui.btn_done = make_pill_button(ui.scr_adjust, 100, 44, C_TRACK, "DONE", &done_label);
+    lv_obj_set_style_text_font(done_label, &font_poppins_22, 0);
+    lv_obj_align(ui.btn_done, LV_ALIGN_CENTER, 56, 123);
     lv_obj_add_event_cb(ui.btn_done, on_adjust_done, LV_EVENT_CLICKED, nullptr);
 }
 

@@ -130,6 +130,16 @@ and turn the knob to set its amount, then tap Done. Dialling an amount into Chai
 Mountain or Inverse switches the Voltra to that style and turns the other two off. The
 five-dot button turns green while any accessory is on.
 
+**Quick adjustment.** From Home, tap the chains chip to use a signed dial: positive
+values select Chains, negative values select Inverse Chains. The **MOUNTAIN ON/OFF**
+button switches to Mountain while preserving the amount, then restores the previous
+Chains/Inverse direction when switched off. Mountain's dial stops at zero. Switch
+profiles while connected and unloaded; the button shows a hint when unavailable.
+**RESET** on either the chains/Mountain or eccentric adjustment screen sets that
+accessory's amount to zero without changing the base weight. **DONE** returns to the
+previous screen. These edits use the same debounced device updates as the dial.
+
+
 ## Troubleshooting
 
 - **The Voltra doesn't appear in the connect menu.** Make sure it is switched on, and
