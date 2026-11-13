@@ -118,12 +118,21 @@ the connect menu again.
 | Do this | To |
 |---|---|
 | Turn the knob | set the weight (slow: 1 lb, fast: 5 lb) |
-| Tap the weight | load / unload (also with the cable already pulled out) |
+| Tap the weight while unloaded | load (also with the cable already pulled out) |
+| Tap anywhere while loaded | unload immediately, including over counters or modifier buttons |
 | Press and hold the weight | start auto load; tap again to cancel it before it loads |
 | Tap a preset | send its weight |
 | Press and hold a preset | store the current weight in it |
 | Tap an accessory bubble | adjust that accessory |
 | Tap the five-dot button | open the accessory settings |
+
+The load/auto-load target has 15 pixels of extra touch padding on every side.
+An amber progress bar confirms an auto-load hold, which stays captured if your
+finger drifts. Tap anywhere on the orange auto-load screen to cancel; the original
+hold must be released before a new cancel tap is accepted.
+
+**While loaded, every screen touch unloads.** Touch controls become available again
+after unloading; the rotary knob continues to work as before.
 
 **Accessory settings.** Four bubbles: Eccentric, Chains, Mountain and Inverse. Tap one
 and turn the knob to set its amount, then tap Done. Dialling an amount into Chains,

@@ -92,6 +92,7 @@ enum SettingsRow : intptr_t {
 struct Ui {
     // main
     lv_obj_t *scr_main = nullptr;
+    lv_obj_t *unload_touch_layer = nullptr; // Global transparent touch target while loaded.
     lv_obj_t *arc_weight = nullptr;
     lv_obj_t *btn_top = nullptr;
     lv_obj_t *lbl_top = nullptr;
@@ -104,6 +105,7 @@ struct Ui {
     lv_obj_t *rep_dot[3] = {};
     bool rep_dots_running = false;
     lv_obj_t *btn_center = nullptr;
+    lv_obj_t *hold_progress = nullptr;
     lv_obj_t *lbl_weight = nullptr;
     lv_obj_t *lbl_unit = nullptr;
     lv_obj_t *row_weight = nullptr;      // the weight number and its unit
@@ -796,7 +798,7 @@ void refresh_main()
         lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
         lv_obj_set_style_text_color(ui.lbl_weight, loaded ? C_LOADED : C_IDLE_NUM, 0);
     } else if (loaded) {
-        lv_label_set_text(ui.lbl_state, "Tap to Unload");
+        lv_label_set_text(ui.lbl_state, "Tap anywhere to unload");
         lv_obj_set_style_text_color(ui.lbl_state, C_TEXT, 0);
         lv_obj_set_style_text_color(ui.lbl_weight, C_LOADED, 0);
     } else if (st.activation == 0) {
@@ -937,6 +939,45 @@ void refresh_main()
     }
 }
 
+// The top layer covers every screen, including modifier/settings screens if the
+// Voltra becomes loaded externally. Also covers the orange auto-load screen for cancellation.
+void refresh_unload_touch_layer()
+{
+    const bool active = !VOLTRA_UI_DEMO && ui.st.conn == ConnState::Ready &&
+                        (ui.st.loaded() || (ui.screen == Screen::Main && ui.auto_view != AutoView::Hidden));
+    set_obj_hidden(ui.unload_touch_layer, !active);
+    if (active) lv_obj_move_foreground(ui.unload_touch_layer);
+}
+
+void on_loaded_screen_pressed(lv_event_t *)
+{
+    // Consume the entire gesture before an unload acknowledgement can reveal the
+    // controls below. Neither release nor a long hold may accidentally load again.
+    if (lv_indev_t *indev = lv_indev_get_act()) lv_indev_wait_release(indev);
+    const bool cancel_auto = ui.screen == Screen::Main && ui.auto_view != AutoView::Hidden;
+    if (VOLTRA_UI_DEMO || ui.st.conn != ConnState::Ready || (!ui.st.loaded() && !cancel_auto)) return;
+    const uint32_t now = millis();
+    if (now < ui.toggle_pending_until && !ui.toggle_target_loaded) return;
+    ui.auto_dismissed = true;
+    ui.auto_load_pending_until = 0;
+    ui.toggle_target_loaded = false;
+    ui.toggle_pending_until = now + TOGGLE_PENDING_MS;
+    VClient::instance().unload(); // Explicit unload, never a load/unload toggle.
+    haptics_click();
+    if (ui.screen == Screen::Main) refresh_main();
+}
+
+void build_unload_touch_layer()
+{
+    ui.unload_touch_layer = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(ui.unload_touch_layer);
+    lv_obj_set_size(ui.unload_touch_layer, LV_PCT(100), LV_PCT(100));
+    lv_obj_center(ui.unload_touch_layer);
+    lv_obj_clear_flag(ui.unload_touch_layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ui.unload_touch_layer, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ui.unload_touch_layer, on_loaded_screen_pressed, LV_EVENT_PRESSED, nullptr);
+}
+
 void on_center_clicked(lv_event_t *)
 {
 #if VOLTRA_UI_DEMO
@@ -973,14 +1014,50 @@ void on_center_clicked(lv_event_t *)
     refresh_main();
 }
 
+void hold_progress_value(void *bar, int32_t value)
+{
+    lv_bar_set_value(static_cast<lv_obj_t *>(bar), value, LV_ANIM_OFF);
+}
+
+void clear_hold_progress()
+{
+    lv_anim_del(ui.hold_progress, hold_progress_value);
+    set_obj_hidden(ui.hold_progress, true);
+}
+
+void on_center_touch(lv_event_t *e)
+{
+    clear_hold_progress();
+    if (lv_event_get_code(e) != LV_EVENT_PRESSED || VOLTRA_UI_DEMO ||
+        ui.st.conn != ConnState::Ready || ui.st.loaded() || ui.st.auto_loading() ||
+        ui.auto_load_pending_until || millis() < ui.toggle_pending_until) return;
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+    lv_bar_set_value(ui.hold_progress, 0, LV_ANIM_OFF);
+    set_obj_hidden(ui.hold_progress, false);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, ui.hold_progress);
+    lv_anim_set_exec_cb(&a, hold_progress_value);
+    lv_anim_set_values(&a, 0, 100);
+    // Follow the actual input driver's hold threshold; no second gesture timer.
+    lv_anim_set_time(&a, indev->driver->long_press_time);
+    lv_anim_start(&a);
+}
+
 /** Press and hold: start the Voltra's auto load (loads once the cable is pulled and held). */
 void on_center_hold(lv_event_t *)
 {
+    clear_hold_progress();
+    // The hold opens a full-screen cancel target. Do not let the same finger
+    // drift onto that new target and cancel the auto-load it just requested.
+    if (lv_indev_t *indev = lv_indev_get_act()) lv_indev_wait_release(indev);
 #if VOLTRA_UI_DEMO
     haptics_buzz();
     return;
 #endif
-    if (ui.st.conn != ConnState::Ready || ui.st.loaded() || ui.st.auto_loading()) {
+    if (ui.st.conn != ConnState::Ready || ui.st.loaded() || ui.st.auto_loading() ||
+        ui.auto_load_pending_until || millis() < ui.toggle_pending_until) {
         haptics_buzz();
         return;
     }
@@ -1101,6 +1178,11 @@ void build_main()
     // The weight's touch target also covers the tap-to-load line at its top.
     ui.btn_center = make_flat_button(ui.scr_main, 236, 150);
     lv_obj_align(ui.btn_center, LV_ALIGN_CENTER, 0, -34);
+    lv_obj_set_ext_click_area(ui.btn_center, 15); // 266 x 180; later sibling controls keep priority.
+    lv_obj_add_flag(ui.btn_center, LV_OBJ_FLAG_PRESS_LOCK); // Keep a hold captured through finger drift.
+    lv_obj_add_event_cb(ui.btn_center, on_center_touch, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(ui.btn_center, on_center_touch, LV_EVENT_RELEASED, nullptr);
+    lv_obj_add_event_cb(ui.btn_center, on_center_touch, LV_EVENT_PRESS_LOST, nullptr);
     // Short-clicked, not clicked, so releasing a hold (auto load) is not also a tap.
     lv_obj_add_event_cb(ui.btn_center, on_center_clicked, LV_EVENT_SHORT_CLICKED, nullptr);
     lv_obj_add_event_cb(ui.btn_center, on_center_hold, LV_EVENT_LONG_PRESSED, nullptr);
@@ -1111,6 +1193,20 @@ void build_main()
     lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);   // 8 px higher on screen than before
     ui.lbl_state = make_label(ui.btn_center, &font_poppins_14, C_MUTED, "");
     lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 1);
+
+    ui.hold_progress = lv_bar_create(ui.scr_main);
+    lv_obj_remove_style_all(ui.hold_progress);
+    lv_obj_set_size(ui.hold_progress, 100, 6);
+    lv_obj_align(ui.hold_progress, LV_ALIGN_CENTER, 0, 43);
+    lv_obj_set_style_radius(ui.hold_progress, 3, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ui.hold_progress, C_TRACK, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ui.hold_progress, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(ui.hold_progress, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(ui.hold_progress, C_WARN, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(ui.hold_progress, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_clear_flag(ui.hold_progress, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ui.hold_progress, LV_OBJ_FLAG_HIDDEN);
+    lv_bar_set_range(ui.hold_progress, 0, 100);
 
     ui.btn_gear = make_pill_button(ui.scr_main, 64, 64, C_TRACK, "", nullptr);
     lv_obj_align(ui.btn_gear, LV_ALIGN_CENTER, 0, 114);
@@ -1846,6 +1942,10 @@ void poll_cb(lv_timer_t *)
     }
 
 
+    if (ui.screen != Screen::Main || ui.st.conn != ConnState::Ready || ui.st.loaded() ||
+        ui.auto_view != AutoView::Hidden) clear_hold_progress();
+    refresh_unload_touch_layer();
+
     // knob battery, every 10 s
     if (now - ui.last_kbat_ms > 10000) {
         ui.last_kbat_ms = now;
@@ -1871,8 +1971,10 @@ void ui_init()
     build_adjust();
     build_connect();
     build_drops();
+    build_unload_touch_layer();
     lv_scr_load(ui.scr_main);
     ui.st = VClient::instance().state();
     refresh_main();
+    refresh_unload_touch_layer();
     lv_timer_create(poll_cb, 25, nullptr);
 }
