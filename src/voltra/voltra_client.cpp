@@ -599,6 +599,7 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
                 if (state_.direct_load_countdown_ms != v) { state_.direct_load_countdown_ms = v; changed = true; }
                 break;
             case PARAM_FITNESS_WORKOUT_STATE:
+                if (pkt.cmd == CMD_PARAM_READ) state_.workout_state_read_ms = millis();
                 if (state_.workout_state != v) { state_.workout_state = v; changed = true; }
                 break;
             case PARAM_BMS_RSOC:
@@ -750,6 +751,22 @@ void Client::startPlainLoad(uint32_t now)
  */
 void Client::startAutoLoad(uint32_t now, bool bypass_countdown)
 {
+    if (state().workout_state <= WORKOUT_STATE_INACTIVE) {
+        // A cold Voltra needs time to enter weight training. Do not send the
+        // auto-load trigger in the next write slot before that transition finishes.
+        Frame prepare[2];
+        prepare[0].len = (uint8_t)build_param_write_u8(prepare[0].data, sizeof(prepare[0].data),
+            PARAM_FITNESS_WORKOUT_STATE, WORKOUT_STATE_ACTIVE, nextSeq());
+        const uint16_t id[] = {PARAM_FITNESS_WORKOUT_STATE};
+        prepare[1].len = (uint8_t)build_param_read(prepare[1].data, sizeof(prepare[1].data), id, 1, nextSeq());
+        enqueueFrontInOrder(prepare, 2);
+        auto_load_preparing_ = true;
+        auto_load_prepare_bypass_ = bypass_countdown;
+        auto_load_prepare_started_ = auto_load_prepare_poll_ = now;
+        load_intent_ = false;
+        return;
+    }
+    auto_load_preparing_ = false;
     static const uint16_t status_ids[] = {PARAM_BP_SET_FITNESS_MODE, PARAM_DIRECT_LOAD_SAFETY_CHECK,
                                           PARAM_DIRECT_LOAD_SAFETY_ST, PARAM_DIRECT_LOAD_COUNTDOWN_MS,
                                           PARAM_DIRECT_LOAD_SAFETY_CTRL};
@@ -757,11 +774,6 @@ void Client::startAutoLoad(uint32_t now, bool bypass_countdown)
     const uint8_t refresh[] = {VENDOR_STATE_REFRESH, 0x01};
     Frame f[4];
     size_t n = 0;
-    if (state().workout_state <= WORKOUT_STATE_INACTIVE) {
-        f[n].len = (uint8_t)build_param_write_u8(f[n].data, sizeof(f[n].data), PARAM_FITNESS_WORKOUT_STATE,
-                                                 WORKOUT_STATE_ACTIVE, nextSeq());
-        n++;
-    }
     f[n].len = (uint8_t)build_vendor(f[n].data, sizeof(f[n].data), trigger, sizeof(trigger), nextSeq());
     n++;
     f[n].len = (uint8_t)build_param_read(f[n].data, sizeof(f[n].data), status_ids,
@@ -854,6 +866,11 @@ void Client::stopScan()
 
 void Client::teardown()
 {
+    auto_load_preparing_ = false;
+    auto_load_watch_until_ = 0;
+    bypass_pending_ = false;
+    load_choosing_ = false;
+    load_intent_ = false;
     write_chr_ = nullptr;
     if (client_) {
         auto *c = static_cast<NimBLEClient *>(client_);
@@ -865,6 +882,14 @@ void Client::teardown()
     q_head_ = q_tail_ = 0;
     lockState();
     state_.protocol_ok = false;
+    state_.fitness_mode = -1;
+    state_.direct_load_status = -1;
+    state_.direct_load_countdown_ms = 0;
+    state_.workout_state = -1;
+    state_.workout_state_read_ms = 0;
+    state_.workout_status = -1;
+    state_.live_force_tenths = -1;
+    reported_mode_ = -1;
     state_.reps = 0;
     state_.sets = 0;
     state_.force_known = false;
@@ -1092,6 +1117,7 @@ void Client::task()
                 wrote_setting = true;
             }
             if (r.load) {
+                auto_load_preparing_ = false;
                 // The cable position picks the kind of load (see below); read it fresh, since
                 // the periodic poll can be 3 s old, and ahead of anything queued so the load
                 // is not held up.
@@ -1106,6 +1132,7 @@ void Client::task()
             }
             if (r.auto_load) startAutoLoad(now, r.direct_load);
             if (r.unload) {
+                auto_load_preparing_ = false;
                 auto_load_watch_until_ = 0;
                 bypass_pending_ = false;
                 load_choosing_ = false;
@@ -1235,6 +1262,25 @@ void Client::task()
                 }
             }
 #endif
+
+            // Wait for a fresh read confirming weight training before triggering once.
+            // Stop within the UI's four-second start window; never load late after timeout.
+            if (conn == ConnState::Ready && auto_load_preparing_) {
+                const DeviceState s = state();
+                if (now - auto_load_prepare_started_ >= 2500 || s.loaded()) {
+                    auto_load_preparing_ = false;
+                } else if (s.workout_state == WORKOUT_STATE_ACTIVE &&
+                           (int32_t)(s.workout_state_read_ms - auto_load_prepare_started_) > 0 &&
+                           now - auto_load_prepare_started_ >= 300) {
+                    startAutoLoad(now, auto_load_prepare_bypass_);
+                } else if (now - auto_load_prepare_poll_ >= 250) {
+                    const uint16_t id[] = {PARAM_FITNESS_WORKOUT_STATE};
+                    uint8_t buf[32];
+                    const size_t len = build_param_read(buf, sizeof(buf), id, 1, nextSeq());
+                    enqueueFront(buf, len);
+                    auto_load_prepare_poll_ = now;
+                }
+            }
 
             // Auto load: poll its countdown quickly until it finishes or the window closes.
             if (conn == ConnState::Ready && auto_load_watch_until_) {

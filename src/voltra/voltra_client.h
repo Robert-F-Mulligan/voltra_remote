@@ -59,6 +59,7 @@ struct DeviceState {
     int fitness_mode = -1;     // raw PARAM_BP_SET_FITNESS_MODE
     int direct_load_countdown_ms = 0;   // auto load: time left before it loads, 0 = none
     int direct_load_status = -1;        // auto load progress (DIRECT_LOAD_ST_*), -1 unknown
+    uint32_t workout_state_read_ms = 0; // Only explicit read responses, not write echoes.
     int workout_state = -1;    // raw PARAM_FITNESS_WORKOUT_STATE
     int activation = -1;       // 1 activated / 0 / -1 unknown
     int force_lb = 0;
@@ -227,6 +228,10 @@ private:
      */
     int reported_mode_ = -1;
     /** While set, poll the auto-load countdown quickly so the screen can count along. */
+    bool auto_load_preparing_ = false;
+    bool auto_load_prepare_bypass_ = false;
+    uint32_t auto_load_prepare_started_ = 0;
+    uint32_t auto_load_prepare_poll_ = 0;
     uint32_t auto_load_watch_until_ = 0;
     uint32_t auto_load_started_ms_ = 0;
     // Direct load: bypass the auto-load countdown once the Voltra reports it is waiting.
